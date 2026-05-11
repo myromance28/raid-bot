@@ -180,10 +180,7 @@ class AttendButton(discord.ui.Button):
         result = attend(self.member_name)
 
         if result == "already":
-            await interaction.response.send_message(
-                "이미 출석됨",
-                ephemeral=True
-            )
+            await interaction.response.send_message("이미 출석됨", ephemeral=True)
             return
 
         members = get_members()
@@ -214,15 +211,17 @@ class CancelButton(discord.ui.Button):
         )
 
 # =========================
-# 🔥 View
+# 🔥 View (30명 대응 핵심 수정)
 # =========================
 class AttendanceView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=None)
 
         for i, name in enumerate(members):
-            self.add_item(AttendButton(name, row=i))
-            self.add_item(CancelButton(name, row=i))
+            row_num = i % 5  # 0~4 반복 (디스코드 row 제한 대응)
+
+            self.add_item(AttendButton(name, row=row_num))
+            self.add_item(CancelButton(name, row=row_num))
 
 # =========================
 # 🔥 명령어
@@ -278,11 +277,7 @@ async def 명단(ctx):
 
 @bot.command()
 async def 주간(ctx):
-
-    today = datetime.now(KST)
-    monday = today - timedelta(days=today.weekday())
-
-    start = monday.strftime("%Y-%m-%d")
+    start = (datetime.now(KST) - timedelta(days=6)).strftime("%Y-%m-%d")
 
     cursor.execute("""
         SELECT name, COUNT(*)
@@ -316,20 +311,17 @@ async def auto_attendance_panel():
 
     while not bot.is_closed():
         now = datetime.now(KST)
-
         current = now.strftime("%H:%M")
 
-        # 🔥 10분 전 알림
+        # 🔥 10분 전 패널 (03/09/15/21)
         target_times = ["02:50", "08:50", "14:50", "20:50"]
 
         if current in target_times and current not in sent_times:
-
             members = get_members()
 
             if members:
                 for guild in bot.guilds:
                     for channel in guild.text_channels:
-
                         try:
                             await channel.send(
                                 "📌 자동 출석 패널",
@@ -341,12 +333,11 @@ async def auto_attendance_panel():
 
             sent_times.add(current)
 
-        # 🔥 일요일 21:00 주간 자동 출력
+        # 🔥 일요일 21:00 주간 정산
         if now.weekday() == 6 and current == "21:00" and not weekly_sent:
 
             today = datetime.now(KST)
             monday = today - timedelta(days=today.weekday())
-
             start = monday.strftime("%Y-%m-%d")
 
             cursor.execute("""
@@ -366,7 +357,6 @@ async def auto_attendance_panel():
 
             for guild in bot.guilds:
                 for channel in guild.text_channels:
-
                     try:
                         await channel.send(text)
                         break
