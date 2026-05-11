@@ -152,81 +152,76 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 안정형 페이지 View (핵심)
+# 🔥 UI (한줄 구조 핵심)
 # =========================
-class AttendanceView(discord.ui.View):
+class RowView(discord.ui.View):
     def __init__(self, members, page=0):
         super().__init__(timeout=None)
+
         self.members = members
         self.page = page
 
-        self.max_page = max(0, (len(members) - 1) // 10)
-
-        self.build()
-
-    def build(self):
-        self.clear_items()
-
-        start = self.page * 10
+        start = page * 10
         end = start + 10
 
-        page_members = self.members[start:end]
+        page_members = members[start:end]
+
+        row_index = 0
 
         for name in page_members:
-            self.add_item(AttendButton(name))
-            self.add_item(CancelButton(name))
+            self.add_item(AttendButton(name, row=row_index))
+            self.add_item(CancelButton(name, row=row_index))
+            row_index += 1
 
         self.add_item(PrevButton())
         self.add_item(NextButton())
 
 # =========================
-# 🔥 버튼들
+# 🔥 버튼
 # =========================
 class AttendButton(discord.ui.Button):
-    def __init__(self, name):
-        self.member_name = name
+    def __init__(self, name, row):
+        self.name = name
 
         done = is_attended(name)
 
         super().__init__(
             label=name,
             style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
-            disabled=done
+            disabled=done,
+            row=row
         )
 
     async def callback(self, interaction: discord.Interaction):
-        attend(self.member_name)
+        attend(self.name)
 
         members = get_members()
-        view = AttendanceView(members, 0)
-
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=view
+            view=RowView(members, 0)
         )
 
 class CancelButton(discord.ui.Button):
-    def __init__(self, name):
-        self.member_name = name
+    def __init__(self, name, row):
+        self.name = name
 
         super().__init__(
             label="취소",
-            style=discord.ButtonStyle.red
+            style=discord.ButtonStyle.red,
+            row=row
         )
 
     async def callback(self, interaction: discord.Interaction):
-        cancel(self.member_name)
+        cancel(self.name)
 
         members = get_members()
-        view = AttendanceView(members, 0)
-
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=view
+            view=RowView(members, 0)
         )
 
 # =========================
-# 🔥 페이지 버튼 (상태 유지 핵심)
+# 🔥 페이지 버튼
 # =========================
 class PrevButton(discord.ui.Button):
     def __init__(self):
@@ -236,13 +231,10 @@ class PrevButton(discord.ui.Button):
         view = interaction.message.view
         members = get_members()
 
-        new_page = max(0, view.page - 1)
-
-        new_view = AttendanceView(members, new_page)
-
+        page = max(0, view.page - 1)
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=new_view
+            view=RowView(members, page)
         )
 
 class NextButton(discord.ui.Button):
@@ -254,14 +246,11 @@ class NextButton(discord.ui.Button):
         members = get_members()
 
         max_page = max(0, (len(members) - 1) // 10)
-
-        new_page = min(max_page, view.page + 1)
-
-        new_view = AttendanceView(members, new_page)
+        page = min(max_page, view.page + 1)
 
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=new_view
+            view=RowView(members, page)
         )
 
 # =========================
@@ -275,11 +264,9 @@ async def 출석(ctx):
         await ctx.send("등록된 인원 없음")
         return
 
-    view = AttendanceView(members, 0)
-
     await ctx.send(
         "📌 출석 패널",
-        view=view
+        view=RowView(members, 0)
     )
 
 @bot.command()
