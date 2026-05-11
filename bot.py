@@ -152,7 +152,35 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 버튼 (단순 안정형)
+# 🔥 안정형 페이지 View (핵심)
+# =========================
+class AttendanceView(discord.ui.View):
+    def __init__(self, members, page=0):
+        super().__init__(timeout=None)
+        self.members = members
+        self.page = page
+
+        self.max_page = max(0, (len(members) - 1) // 10)
+
+        self.build()
+
+    def build(self):
+        self.clear_items()
+
+        start = self.page * 10
+        end = start + 10
+
+        page_members = self.members[start:end]
+
+        for name in page_members:
+            self.add_item(AttendButton(name))
+            self.add_item(CancelButton(name))
+
+        self.add_item(PrevButton())
+        self.add_item(NextButton())
+
+# =========================
+# 🔥 버튼들
 # =========================
 class AttendButton(discord.ui.Button):
     def __init__(self, name):
@@ -170,9 +198,11 @@ class AttendButton(discord.ui.Button):
         attend(self.member_name)
 
         members = get_members()
+        view = AttendanceView(members, 0)
+
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=AttendanceView(members, 0)
+            view=view
         )
 
 class CancelButton(discord.ui.Button):
@@ -188,54 +218,54 @@ class CancelButton(discord.ui.Button):
         cancel(self.member_name)
 
         members = get_members()
+        view = AttendanceView(members, 0)
+
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=AttendanceView(members, 0)
+            view=view
         )
 
 # =========================
-# 🔥 페이지 View (안정형 핵심)
+# 🔥 페이지 버튼 (상태 유지 핵심)
 # =========================
-class AttendanceView(discord.ui.View):
-    def __init__(self, members, page=0):
-        super().__init__(timeout=None)
-
-        self.members = members
-        self.page = page
-
-        start = page * 10
-        end = start + 10
-
-        page_members = members[start:end]
-
-        for name in page_members:
-            self.add_item(AttendButton(name))
-            self.add_item(CancelButton(name))
-
-        # 페이지 버튼
-        self.add_item(PrevButton())
-        self.add_item(NextButton())
-
 class PrevButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="◀", style=discord.ButtonStyle.gray)
 
     async def callback(self, interaction: discord.Interaction):
+        view = interaction.message.view
         members = get_members()
-        view = AttendanceView(members, 0)
-        await interaction.response.edit_message(content="📌 출석 패널", view=view)
+
+        new_page = max(0, view.page - 1)
+
+        new_view = AttendanceView(members, new_page)
+
+        await interaction.response.edit_message(
+            content="📌 출석 패널",
+            view=new_view
+        )
 
 class NextButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="▶", style=discord.ButtonStyle.gray)
 
     async def callback(self, interaction: discord.Interaction):
+        view = interaction.message.view
         members = get_members()
-        view = AttendanceView(members, 1)
-        await interaction.response.edit_message(content="📌 출석 패널", view=view)
+
+        max_page = max(0, (len(members) - 1) // 10)
+
+        new_page = min(max_page, view.page + 1)
+
+        new_view = AttendanceView(members, new_page)
+
+        await interaction.response.edit_message(
+            content="📌 출석 패널",
+            view=new_view
+        )
 
 # =========================
-# 🔥 명령어
+# 🔹 명령어
 # =========================
 @bot.command()
 async def 출석(ctx):
@@ -245,9 +275,11 @@ async def 출석(ctx):
         await ctx.send("등록된 인원 없음")
         return
 
+    view = AttendanceView(members, 0)
+
     await ctx.send(
         "📌 출석 패널",
-        view=AttendanceView(members, 0)
+        view=view
     )
 
 @bot.command()
@@ -265,9 +297,7 @@ async def 삭제(ctx, name: str):
 @bot.command()
 async def 명단(ctx):
     members = get_members()
-
-    text = "\n".join(members) if members else "없음"
-    await ctx.send(text)
+    await ctx.send("\n".join(members) if members else "없음")
 
 @bot.command()
 async def 주간(ctx):
@@ -290,7 +320,7 @@ async def 주간(ctx):
     await ctx.send(text)
 
 # =========================
-# 🔥 실행
+# 🔹 실행
 # =========================
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
