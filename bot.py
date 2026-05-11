@@ -13,7 +13,7 @@ import threading
 KST = timezone(timedelta(hours=9))
 
 # =========================
-# 🔹 Flask (Render 유지)
+# 🔹 Flask
 # =========================
 app = Flask(__name__)
 
@@ -151,7 +151,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 UI (핵심: 세로 정렬 + 페이지)
+# 🔥 UI (완전 안정형)
 # =========================
 class RowView(discord.ui.View):
     def __init__(self, members, page=0):
@@ -165,12 +165,12 @@ class RowView(discord.ui.View):
 
         page_members = members[start:end]
 
-        row = 0
+        # 🔥 핵심: row는 무조건 0~4 유지 (디스코드 제한 해결)
+        for i, name in enumerate(page_members):
+            row = i % 5
 
-        for name in page_members:
             self.add_item(AttendButton(name, row=row))
             self.add_item(CancelButton(name, row=row))
-            row += 1
 
         self.add_item(PrevButton())
         self.add_item(NextButton())
