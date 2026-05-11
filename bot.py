@@ -5,7 +5,6 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 from threading import Thread
-import asyncio
 import threading
 
 # =========================
@@ -14,7 +13,7 @@ import threading
 KST = timezone(timedelta(hours=9))
 
 # =========================
-# 🔹 Flask
+# 🔹 Flask (Render 유지)
 # =========================
 app = Flask(__name__)
 
@@ -152,7 +151,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 UI (한줄 구조 핵심)
+# 🔥 UI (핵심: 세로 정렬 + 페이지)
 # =========================
 class RowView(discord.ui.View):
     def __init__(self, members, page=0):
@@ -166,12 +165,12 @@ class RowView(discord.ui.View):
 
         page_members = members[start:end]
 
-        row_index = 0
+        row = 0
 
         for name in page_members:
-            self.add_item(AttendButton(name, row=row_index))
-            self.add_item(CancelButton(name, row=row_index))
-            row_index += 1
+            self.add_item(AttendButton(name, row=row))
+            self.add_item(CancelButton(name, row=row))
+            row += 1
 
         self.add_item(PrevButton())
         self.add_item(NextButton())
@@ -232,6 +231,7 @@ class PrevButton(discord.ui.Button):
         members = get_members()
 
         page = max(0, view.page - 1)
+
         await interaction.response.edit_message(
             content="📌 출석 패널",
             view=RowView(members, page)
@@ -307,7 +307,7 @@ async def 주간(ctx):
     await ctx.send(text)
 
 # =========================
-# 🔹 실행
+# 🔥 실행
 # =========================
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
