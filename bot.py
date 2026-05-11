@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+import os
 
 # ===== 기본 설정 =====
 intents = discord.Intents.default()
