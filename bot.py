@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS members (
 
 conn.commit()
 
-# 🔥 DB 락 (추가)
+# 🔥 DB Lock
 db_lock = threading.Lock()
 
 # =========================
@@ -132,12 +132,21 @@ def cancel(name):
     return "ok"
 
 # =========================
-# 🔹 Discord
+# 🔹 Discord Bot (수정 핵심)
 # =========================
+
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ✅ 수정 1: Bot 클래스 변경
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        self.create_task(auto_panel_10min())
+
+
+# ✅ 수정 2: bot 생성 변경
+bot = MyBot(command_prefix="!", intents=intents)
 
 # =========================
 # 🔹 버튼 UI
@@ -196,7 +205,7 @@ async def 랭킹(ctx):
     await ctx.send(text)
 
 # =========================
-# 🔥 자동 10분 전 패널 (추가)
+# 🔥 자동 10분 전 패널
 # =========================
 async def auto_panel_10min():
     await bot.wait_until_ready()
@@ -242,24 +251,7 @@ async def auto_panel_10min():
         await asyncio.sleep(30)
 
 # =========================
-# 🧪 테스트 명령어
-# =========================
-@bot.command()
-async def 테스트출석(ctx):
-    members = get_members()
-
-    if not members:
-        await ctx.send("등록된 인원 없음")
-        return
-
-    text = "🧪 테스트 출석 UI\n\n" + "\n".join(members)
-    await ctx.send(text, view=AttendanceView())
-
-# =========================
 # 🔹 실행
 # =========================
 keep_alive()
-
-bot.loop.create_task(auto_panel_10min())
-
 bot.run(os.getenv("DISCORD_TOKEN"))
