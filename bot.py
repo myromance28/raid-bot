@@ -55,7 +55,7 @@ conn.commit()
 db_lock = threading.Lock()
 
 # =========================
-# 🔹 슬롯 (3/9/15/21)
+# 🔹 슬롯
 # =========================
 def get_slot():
     hour = datetime.now(KST).hour
@@ -88,7 +88,7 @@ def get_members():
         return [r[0] for r in cursor.fetchall()]
 
 # =========================
-# 🔹 출석 (1점 = 1타임)
+# 🔹 출석
 # =========================
 def attend(name):
     date = datetime.now(KST).strftime("%Y-%m-%d")
@@ -138,14 +138,10 @@ def cancel(name):
 intents = discord.Intents.default()
 intents.message_content = True
 
-class MyBot(commands.Bot):
-    async def setup_hook(self):
-        asyncio.create_task(auto_panel_10min())
-
-bot = MyBot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔹 버튼 UI (핵심)
+# 🔹 버튼 UI
 # =========================
 def is_attended(name):
     date = datetime.now(KST).strftime("%Y-%m-%d")
@@ -187,15 +183,7 @@ class CancelButton(discord.ui.Button):
         self.member_name = name
 
     async def callback(self, interaction):
-        date = datetime.now(KST).strftime("%Y-%m-%d")
-        slot = get_slot()
-
-        cursor.execute(
-            "DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?",
-            (date, slot, self.member_name)
-        )
-        conn.commit()
-
+        cancel(self.member_name)
         await interaction.response.send_message(f"{self.member_name} 취소 완료", ephemeral=True)
 
 
@@ -208,18 +196,30 @@ class AttendanceView(discord.ui.View):
             self.add_item(CancelButton(name))
 
 # =========================
-# 🔹 명령어
+# 🔥 출석 명령어 (핵심 수정)
 # =========================
 @bot.command()
 async def 출석(ctx):
-    members = get_members()
+    try:
+        members = get_members()
 
-    if not members:
-        await ctx.send("등록된 인원 없음")
-        return
+        if not members:
+            await ctx.send("등록된 인원 없음")
+            return
 
-    await ctx.send("📌 출석", view=AttendanceView(members))
+        print("출석 호출됨:", members)
 
+        await ctx.send(
+            "📌 출석 패널",
+            view=AttendanceView(members)
+        )
+
+    except Exception as e:
+        await ctx.send(f"출석 오류 발생: {e}")
+
+# =========================
+# 🔹 추가 / 삭제
+# =========================
 @bot.command()
 async def 추가(ctx, name: str):
     add_member(name)
@@ -231,7 +231,7 @@ async def 삭제(ctx, name: str):
     await ctx.send(f"{name} 삭제 완료")
 
 # =========================
-# 🔥 주간 점수 추가 (핵심)
+# 🔹 주간
 # =========================
 @bot.command()
 async def 주간(ctx):
@@ -256,43 +256,6 @@ async def 주간(ctx):
         text += f"{i}. {r[0]} - {r[1]}점\n"
 
     await ctx.send(text)
-
-# =========================
-# 🔥 자동 패널 (기존 유지)
-# =========================
-async def auto_panel_10min():
-    await bot.wait_until_ready()
-
-    notified = set()
-
-    while not bot.is_closed():
-        now = datetime.now(KST)
-        today = now.strftime("%Y-%m-%d")
-
-        schedule = {3:"03", 9:"09", 15:"15", 21:"21"}
-
-        for hour, slot in schedule.items():
-            if now.hour == hour and now.minute == 50:
-
-                key = f"{today}-{slot}"
-
-                if key in notified:
-                    continue
-
-                channel = discord.utils.get(bot.get_all_channels(), name="출석")
-
-                if channel:
-                    members = get_members()
-                    text = f"⏰ {slot}시 출석 10분 전\n\n" + "\n".join(members)
-
-                    await channel.send(text, view=AttendanceView(members))
-
-                notified.add(key)
-
-        if now.hour == 0 and now.minute == 0:
-            notified.clear()
-
-        await asyncio.sleep(30)
 
 # =========================
 # 🔥 실행
