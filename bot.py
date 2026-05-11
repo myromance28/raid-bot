@@ -1,83 +1,116 @@
 import discord
 from discord.ext import commands
 import os
+import sqlite3
+from datetime import datetime
+from flask import Flask
+from threading import Thread
 
-# ===== 기본 설정 =====
+# =========================
+# 🔹 Flask (Render 안 꺼지게)
+# =========================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "OK"
+
+def run():
+    app.run(host="0.0.0.0", port=10000)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# =========================
+# 🔹 SQLite DB 설정
+# =========================
+conn = sqlite3.connect("data.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS attendance (
+    date TEXT,
+    name TEXT
+)
+""")
+conn.commit()
+
+# =========================
+# 🔹 출석 / 취소 로직
+# =========================
+def attend(name):
+    date = datetime.now().strftime("%Y-%m-%d")
+
+    cursor.execute(
+        "SELECT * FROM attendance WHERE date=? AND name=?",
+        (date, name)
+    )
+
+    if cursor.fetchone():
+        return "already"
+
+    cursor.execute(
+        "INSERT INTO attendance VALUES (?, ?)",
+        (date, name)
+    )
+
+    conn.commit()
+    return "ok"
+
+
+def cancel(name):
+    date = datetime.now().strftime("%Y-%m-%d")
+
+    cursor.execute(
+        "DELETE FROM attendance WHERE date=? AND name=?",
+        (date, name)
+    )
+
+    conn.commit()
+    return "cancel"
+
+# =========================
+# 🔹 Discord 봇 설정
+# =========================
 intents = discord.Intents.default()
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-# ===== 점수 시스템 =====
-scores = {
-    "법소리": 0,
-    "원턴": 0,
-    "으르렁": 0
-}
-
-# 중복 방지 (유저 + 캐릭터 기준)
-attended = set()
-
-# ===== 버튼 UI =====
+# =========================
+# 🔹 버튼 UI
+# =========================
 class RaidView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
 
-    async def give_point(self, interaction, name):
+    @discord.ui.button(label="출석", style=discord.ButtonStyle.green)
+    async def attend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        name = interaction.user.display_name
 
-        user_id = interaction.user.id
-        key = f"{user_id}_{name}"
+        result = attend(name)
 
-        # 중복 체크
-        if key in attended:
-            await interaction.response.send_message("이미 이 캐릭터로 출석했어요", ephemeral=True)
-            return
+        if result == "already":
+            await interaction.response.send_message("이미 출석 완료됨", ephemeral=True)
+        else:
+            await interaction.response.send_message("출석 완료 +1", ephemeral=True)
 
-        attended.add(key)
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.red)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        name = interaction.user.display_name
 
-        # 점수 증가
-        scores[name] += 1
+        cancel(name)
 
-        await interaction.response.send_message(
-            f"✅ {name} +1점 완료 (총 {scores[name]}점)",
-            ephemeral=True
-        )
+        await interaction.response.send_message("출석 취소 완료 -1", ephemeral=True)
 
-    @discord.ui.button(label="법소리 출석", style=discord.ButtonStyle.green)
-    async def bosori(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.give_point(interaction, "법소리")
-
-    @discord.ui.button(label="원턴 출석", style=discord.ButtonStyle.green)
-    async def oneturn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.give_point(interaction, "원턴")
-
-    @discord.ui.button(label="으르렁 출석", style=discord.ButtonStyle.green)
-    async def growl(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.give_point(interaction, "으르렁")
-
-# ===== 봇 시작 =====
-@bot.event
-async def on_ready():
-    print("봇 실행 완료")
-
-    channel_id = 1170263342926004334  # 👈 여기에 채널 ID 넣기
-    channel = bot.get_channel(channel_id)
-
-    if channel:
-        await channel.send("📢 레이드 출석 체크", view=RaidView())
-
-# ===== 랭킹 명령어 =====
+# =========================
+# 🔹 명령어 (출석 패널 생성)
+# =========================
 @bot.command()
-async def 랭킹(ctx):
+async def 출석(ctx):
+    await ctx.send("📌 출석 버튼", view=RaidView())
 
-    sorted_data = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    msg = "\n".join([
-        f"{i+1}. {name} {score}점"
-        for i, (name, score) in enumerate(sorted_data)
-    ])
-
-    await ctx.send(msg if msg else "아직 점수 없음")
-
-# ===== 실행 =====
-bot.run(TOKEN)
+# =========================
+# 🔹 봇 실행
+# =========================
+keep_alive()
+bot.run(os.getenv("DISCORD_TOKEN"))
