@@ -6,6 +6,7 @@ from datetime import datetime
 from flask import Flask
 from threading import Thread
 import asyncio
+import threading
 
 # =========================
 # 🔹 Flask (Render 유지용)
@@ -46,6 +47,9 @@ CREATE TABLE IF NOT EXISTS members (
 
 conn.commit()
 
+# 🔥 DB 락 (추가)
+db_lock = threading.Lock()
+
 # =========================
 # 🔹 시간 슬롯 (3/9/15/21)
 # =========================
@@ -65,16 +69,19 @@ def get_slot():
 # 🔹 이름 관리
 # =========================
 def add_member(name):
-    cursor.execute("INSERT OR IGNORE INTO members(name, total) VALUES(?, 0)", (name,))
-    conn.commit()
+    with db_lock:
+        cursor.execute("INSERT OR IGNORE INTO members(name, total) VALUES(?, 0)", (name,))
+        conn.commit()
 
 def remove_member(name):
-    cursor.execute("DELETE FROM members WHERE name=?", (name,))
-    conn.commit()
+    with db_lock:
+        cursor.execute("DELETE FROM members WHERE name=?", (name,))
+        conn.commit()
 
 def get_members():
-    cursor.execute("SELECT name FROM members ORDER BY name ASC")
-    return [r[0] for r in cursor.fetchall()]
+    with db_lock:
+        cursor.execute("SELECT name FROM members ORDER BY name ASC")
+        return [r[0] for r in cursor.fetchall()]
 
 # =========================
 # 🔹 출석
@@ -83,27 +90,29 @@ def attend(name):
     date = datetime.now().strftime("%Y-%m-%d")
     slot = get_slot()
 
-    cursor.execute(
-        "SELECT * FROM attendance WHERE date=? AND time_slot=? AND name=?",
-        (date, slot, name)
-    )
+    with db_lock:
+        cursor.execute(
+            "SELECT * FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            (date, slot, name)
+        )
 
-    if cursor.fetchone():
-        return "already"
+        if cursor.fetchone():
+            return "already"
 
-    cursor.execute(
-        "INSERT INTO attendance VALUES (?, ?, ?)",
-        (date, slot, name)
-    )
+        cursor.execute(
+            "INSERT INTO attendance VALUES (?, ?, ?)",
+            (date, slot, name)
+        )
 
-    cursor.execute("""
-        INSERT INTO members(name, total)
-        VALUES(?, 1)
-        ON CONFLICT(name)
-        DO UPDATE SET total = total + 1
-    """, (name,))
+        cursor.execute("""
+            INSERT INTO members(name, total)
+            VALUES(?, 1)
+            ON CONFLICT(name)
+            DO UPDATE SET total = total + 1
+        """, (name,))
 
-    conn.commit()
+        conn.commit()
+
     return "ok"
 
 # =========================
@@ -113,12 +122,13 @@ def cancel(name):
     date = datetime.now().strftime("%Y-%m-%d")
     slot = get_slot()
 
-    cursor.execute(
-        "DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?",
-        (date, slot, name)
-    )
+    with db_lock:
+        cursor.execute(
+            "DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            (date, slot, name)
+        )
+        conn.commit()
 
-    conn.commit()
     return "ok"
 
 # =========================
@@ -153,7 +163,6 @@ class AttendanceView(discord.ui.View):
 # 🔹 명령어
 # =========================
 
-# 출석 패널
 @bot.command()
 async def 출석(ctx):
     members = get_members()
@@ -163,22 +172,18 @@ async def 출석(ctx):
         return
 
     text = "📌 출석 명단\n\n" + "\n".join(members)
-
     await ctx.send(text, view=AttendanceView())
 
-# 이름 추가
 @bot.command()
 async def 추가(ctx, name: str):
     add_member(name)
     await ctx.send(f"{name} 추가 완료")
 
-# 이름 삭제
 @bot.command()
 async def 삭제(ctx, name: str):
     remove_member(name)
     await ctx.send(f"{name} 삭제 완료")
 
-# 랭킹
 @bot.command()
 async def 랭킹(ctx):
     cursor.execute("SELECT name, total FROM members ORDER BY total DESC")
@@ -191,7 +196,70 @@ async def 랭킹(ctx):
     await ctx.send(text)
 
 # =========================
+# 🔥 자동 10분 전 패널 (추가)
+# =========================
+async def auto_panel_10min():
+    await bot.wait_until_ready()
+
+    notified = set()
+
+    while not bot.is_closed():
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+
+        schedule = {
+            3: "03",
+            9: "09",
+            15: "15",
+            21: "21"
+        }
+
+        for hour, slot in schedule.items():
+
+            if now.hour == hour and now.minute == 50:
+
+                key = f"{today}-{slot}"
+
+                if key in notified:
+                    continue
+
+                channel = discord.utils.get(bot.get_all_channels(), name="출석")
+
+                if channel:
+                    members = get_members()
+
+                    if members:
+                        text = f"⏰ {slot}시 출석 10분 전\n\n"
+                        text += "\n".join(members)
+
+                        await channel.send(text, view=AttendanceView())
+
+                notified.add(key)
+
+        if now.hour == 0 and now.minute == 0:
+            notified.clear()
+
+        await asyncio.sleep(30)
+
+# =========================
+# 🧪 테스트 명령어
+# =========================
+@bot.command()
+async def 테스트출석(ctx):
+    members = get_members()
+
+    if not members:
+        await ctx.send("등록된 인원 없음")
+        return
+
+    text = "🧪 테스트 출석 UI\n\n" + "\n".join(members)
+    await ctx.send(text, view=AttendanceView())
+
+# =========================
 # 🔹 실행
 # =========================
 keep_alive()
+
+bot.loop.create_task(auto_panel_10min())
+
 bot.run(os.getenv("DISCORD_TOKEN"))
