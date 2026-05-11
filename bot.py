@@ -9,12 +9,12 @@ import asyncio
 import threading
 
 # =========================
-# 🔹 KST 시간
+# 🔹 KST
 # =========================
 KST = timezone(timedelta(hours=9))
 
 # =========================
-# 🔹 Flask (Render 유지용)
+# 🔹 Flask (Render 유지)
 # =========================
 app = Flask(__name__)
 
@@ -141,7 +141,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔹 버튼 UI
+# 🔹 상태 체크
 # =========================
 def is_attended(name):
     date = datetime.now(KST).strftime("%Y-%m-%d")
@@ -154,9 +154,11 @@ def is_attended(name):
 
     return cursor.fetchone() is not None
 
-
+# =========================
+# 🔥 버튼 (세로 정렬 핵심)
+# =========================
 class AttendButton(discord.ui.Button):
-    def __init__(self, name):
+    def __init__(self, name, row):
         self.member_name = name
 
         done = is_attended(name)
@@ -164,7 +166,7 @@ class AttendButton(discord.ui.Button):
         super().__init__(
             label=name,
             style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
-            row=0,
+            row=row,
             disabled=done
         )
 
@@ -178,48 +180,42 @@ class AttendButton(discord.ui.Button):
 
 
 class CancelButton(discord.ui.Button):
-    def __init__(self, name):
-        super().__init__(label="취소", style=discord.ButtonStyle.red, row=0)
+    def __init__(self, name, row):
+        super().__init__(
+            label="취소",
+            style=discord.ButtonStyle.red,
+            row=row
+        )
         self.member_name = name
 
     async def callback(self, interaction):
         cancel(self.member_name)
         await interaction.response.send_message(f"{self.member_name} 취소 완료", ephemeral=True)
 
-
+# =========================
+# 🔥 View (세로 정렬)
+# =========================
 class AttendanceView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=None)
 
-        for name in members:
-            self.add_item(AttendButton(name))
-            self.add_item(CancelButton(name))
+        for i, name in enumerate(members):
+            self.add_item(AttendButton(name, row=i))
+            self.add_item(CancelButton(name, row=i))
 
 # =========================
-# 🔥 출석 명령어 (핵심 수정)
+# 🔥 명령어
 # =========================
 @bot.command()
 async def 출석(ctx):
-    try:
-        members = get_members()
+    members = get_members()
 
-        if not members:
-            await ctx.send("등록된 인원 없음")
-            return
+    if not members:
+        await ctx.send("등록된 인원 없음")
+        return
 
-        print("출석 호출됨:", members)
+    await ctx.send("📌 출석 패널", view=AttendanceView(members))
 
-        await ctx.send(
-            "📌 출석 패널",
-            view=AttendanceView(members)
-        )
-
-    except Exception as e:
-        await ctx.send(f"출석 오류 발생: {e}")
-
-# =========================
-# 🔹 추가 / 삭제
-# =========================
 @bot.command()
 async def 추가(ctx, name: str):
     add_member(name)
@@ -230,9 +226,6 @@ async def 삭제(ctx, name: str):
     remove_member(name)
     await ctx.send(f"{name} 삭제 완료")
 
-# =========================
-# 🔹 주간
-# =========================
 @bot.command()
 async def 주간(ctx):
     start = (datetime.now(KST) - timedelta(days=6)).strftime("%Y-%m-%d")
