@@ -47,11 +47,13 @@ CREATE TABLE IF NOT EXISTS members (
 
 conn.commit()
 
-# 🔥 DB Lock
+# =========================
+# 🔹 DB Lock
+# =========================
 db_lock = threading.Lock()
 
 # =========================
-# 🔹 시간 슬롯 (3/9/15/21)
+# 🔹 시간 슬롯
 # =========================
 def get_slot():
     hour = datetime.now().hour
@@ -138,14 +140,10 @@ def cancel(name):
 intents = discord.Intents.default()
 intents.message_content = True
 
-
-# ✅ 수정 1: Bot 클래스 변경
 class MyBot(commands.Bot):
     async def setup_hook(self):
-        self.create_task(auto_panel_10min())
+        asyncio.create_task(auto_panel_10min())
 
-
-# ✅ 수정 2: bot 생성 변경
 bot = MyBot(command_prefix="!", intents=intents)
 
 # =========================
@@ -171,7 +169,6 @@ class AttendanceView(discord.ui.View):
 # =========================
 # 🔹 명령어
 # =========================
-
 @bot.command()
 async def 출석(ctx):
     members = get_members()
