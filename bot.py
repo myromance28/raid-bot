@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS members (
 conn.commit()
 
 # =========================
-# 🔹 현재 시간 슬롯 계산
+# 🔹 시간 슬롯
 # =========================
 def get_slot():
     hour = datetime.now().hour
@@ -62,7 +62,7 @@ def get_slot():
         return "15"
 
 # =========================
-# 🔹 출석 / 취소
+# 🔹 출석
 # =========================
 def attend(name):
     date = datetime.now().strftime("%Y-%m-%d")
@@ -91,7 +91,9 @@ def attend(name):
     conn.commit()
     return "ok"
 
-
+# =========================
+# 🔹 취소
+# =========================
 def cancel(name):
     date = datetime.now().strftime("%Y-%m-%d")
     slot = get_slot()
@@ -133,16 +135,17 @@ def weekly_data():
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔹 버튼 UI (출석 + 취소)
+# 🔹 버튼 UI
 # =========================
 class AttendanceView(discord.ui.View):
 
     @discord.ui.button(label="출석", style=discord.ButtonStyle.green)
-    async def attend_btn(self, interaction, button):
+    async def attend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         name = interaction.user.display_name
 
         result = attend(name)
@@ -153,7 +156,7 @@ class AttendanceView(discord.ui.View):
             await interaction.response.send_message("출석 완료", ephemeral=True)
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.red)
-    async def cancel_btn(self, interaction, button):
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         name = interaction.user.display_name
 
         result = cancel(name)
@@ -166,11 +169,9 @@ class AttendanceView(discord.ui.View):
 # =========================
 # 🔹 명령어
 # =========================
-
 @bot.command()
 async def 출석(ctx):
     await ctx.send("📌 출석 체크", view=AttendanceView())
-
 
 @bot.command()
 async def 주간(ctx):
@@ -186,11 +187,9 @@ async def 주간(ctx):
 
     await ctx.send(text)
 
-
 @bot.command()
 async def 랭킹(ctx):
     cursor.execute("SELECT name, total FROM members ORDER BY total DESC")
-
     rows = cursor.fetchall()
 
     if not rows:
@@ -204,7 +203,15 @@ async def 랭킹(ctx):
     await ctx.send(text)
 
 # =========================
-# 🔹 주간 자동 리포트
+# 🔹 on_ready (핵심 수정)
+# =========================
+@bot.event
+async def on_ready():
+    print("Bot is ready")
+    bot.loop.create_task(weekly_task())
+
+# =========================
+# 🔹 주간 자동 보고
 # =========================
 async def weekly_task():
     await bot.wait_until_ready()
@@ -230,5 +237,4 @@ async def weekly_task():
 # 🔹 실행
 # =========================
 keep_alive()
-bot.loop.create_task(weekly_task())
 bot.run(os.getenv("DISCORD_TOKEN"))
