@@ -155,7 +155,7 @@ def is_attended(name):
     return cursor.fetchone() is not None
 
 # =========================
-# 🔥 버튼 (세로 정렬 핵심)
+# 🔥 버튼 (핵심 수정 완료)
 # =========================
 class AttendButton(discord.ui.Button):
     def __init__(self, name, row):
@@ -175,9 +175,14 @@ class AttendButton(discord.ui.Button):
 
         if result == "already":
             await interaction.response.send_message("이미 출석됨", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"{self.member_name} 출석 +1", ephemeral=True)
+            return
 
+        # 🔥 출석 후 UI 즉시 갱신
+        members = get_members()
+        await interaction.response.edit_message(
+            content="📌 출석 패널 (업데이트됨)",
+            view=AttendanceView(members)
+        )
 
 class CancelButton(discord.ui.Button):
     def __init__(self, name, row):
