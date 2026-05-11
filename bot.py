@@ -13,7 +13,7 @@ import threading
 KST = timezone(timedelta(hours=9))
 
 # =========================
-# 🔹 Flask
+# 🔹 Flask (Render 유지)
 # =========================
 app = Flask(__name__)
 
@@ -151,20 +151,16 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 UI (페이지 제거 버전)
+# 🔥 UI (완전 최종 핵심)
 # =========================
-class RowView(discord.ui.View):
+class AttendanceView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=None)
 
-        # 🔥 최대 20명 정도만 안정 출력 (페이지 제거 대체)
-        members = members[:20]
-
+        # 👉 전체 인원 출력 (제한 없음)
         for i, name in enumerate(members):
-            row = i % 5
-
-            self.add_item(AttendButton(name, row=row))
-            self.add_item(CancelButton(name, row=row))
+            self.add_item(AttendButton(name, row=i))
+            self.add_item(CancelButton(name, row=i))
 
 # =========================
 # 🔥 버튼
@@ -188,7 +184,7 @@ class AttendButton(discord.ui.Button):
         members = get_members()
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=RowView(members)
+            view=AttendanceView(members)
         )
 
 class CancelButton(discord.ui.Button):
@@ -207,7 +203,7 @@ class CancelButton(discord.ui.Button):
         members = get_members()
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=RowView(members)
+            view=AttendanceView(members)
         )
 
 # =========================
@@ -223,7 +219,7 @@ async def 출석(ctx):
 
     await ctx.send(
         "📌 출석 패널",
-        view=RowView(members)
+        view=AttendanceView(members)
     )
 
 @bot.command()
