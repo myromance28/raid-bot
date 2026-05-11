@@ -2,11 +2,16 @@ import discord
 from discord.ext import commands
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask
 from threading import Thread
 import asyncio
 import threading
+
+# =========================
+# 🔹 KST 시간
+# =========================
+KST = timezone(timedelta(hours=9))
 
 # =========================
 # 🔹 Flask (Render 유지용)
@@ -47,16 +52,13 @@ CREATE TABLE IF NOT EXISTS members (
 
 conn.commit()
 
-# =========================
-# 🔹 DB Lock
-# =========================
 db_lock = threading.Lock()
 
 # =========================
-# 🔹 시간 슬롯
+# 🔹 슬롯 (3/9/15/21)
 # =========================
 def get_slot():
-    hour = datetime.now().hour
+    hour = datetime.now(KST).hour
 
     if 0 <= hour < 6:
         return "21"
@@ -86,15 +88,15 @@ def get_members():
         return [r[0] for r in cursor.fetchall()]
 
 # =========================
-# 🔹 출석
+# 🔹 출석 (1점 = 1타임)
 # =========================
 def attend(name):
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
 
     with db_lock:
         cursor.execute(
-            "SELECT * FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            "SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?",
             (date, slot, name)
         )
 
@@ -117,11 +119,8 @@ def attend(name):
 
     return "ok"
 
-# =========================
-# 🔹 취소
-# =========================
 def cancel(name):
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
 
     with db_lock:
@@ -134,9 +133,8 @@ def cancel(name):
     return "ok"
 
 # =========================
-# 🔹 Discord Bot (수정 핵심)
+# 🔹 봇
 # =========================
-
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -147,24 +145,67 @@ class MyBot(commands.Bot):
 bot = MyBot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔹 버튼 UI
+# 🔹 버튼 UI (핵심)
 # =========================
-class AttendanceView(discord.ui.View):
+def is_attended(name):
+    date = datetime.now(KST).strftime("%Y-%m-%d")
+    slot = get_slot()
 
-    @discord.ui.button(label="출석", style=discord.ButtonStyle.green)
-    async def attend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        name = interaction.user.display_name
-        result = attend(name)
+    cursor.execute(
+        "SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?",
+        (date, slot, name)
+    )
+
+    return cursor.fetchone() is not None
+
+
+class AttendButton(discord.ui.Button):
+    def __init__(self, name):
+        self.member_name = name
+
+        done = is_attended(name)
+
+        super().__init__(
+            label=name,
+            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
+            row=0,
+            disabled=done
+        )
+
+    async def callback(self, interaction):
+        result = attend(self.member_name)
 
         if result == "already":
-            await interaction.response.send_message("이미 출석 완료", ephemeral=True)
+            await interaction.response.send_message("이미 출석됨", ephemeral=True)
         else:
-            await interaction.response.send_message("출석 완료", ephemeral=True)
+            await interaction.response.send_message(f"{self.member_name} 출석 +1", ephemeral=True)
 
-    @discord.ui.button(label="취소", style=discord.ButtonStyle.red)
-    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cancel(interaction.user.display_name)
-        await interaction.response.send_message("취소 완료", ephemeral=True)
+
+class CancelButton(discord.ui.Button):
+    def __init__(self, name):
+        super().__init__(label="취소", style=discord.ButtonStyle.red, row=0)
+        self.member_name = name
+
+    async def callback(self, interaction):
+        date = datetime.now(KST).strftime("%Y-%m-%d")
+        slot = get_slot()
+
+        cursor.execute(
+            "DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            (date, slot, self.member_name)
+        )
+        conn.commit()
+
+        await interaction.response.send_message(f"{self.member_name} 취소 완료", ephemeral=True)
+
+
+class AttendanceView(discord.ui.View):
+    def __init__(self, members):
+        super().__init__(timeout=None)
+
+        for name in members:
+            self.add_item(AttendButton(name))
+            self.add_item(CancelButton(name))
 
 # =========================
 # 🔹 명령어
@@ -177,8 +218,7 @@ async def 출석(ctx):
         await ctx.send("등록된 인원 없음")
         return
 
-    text = "📌 출석 명단\n\n" + "\n".join(members)
-    await ctx.send(text, view=AttendanceView())
+    await ctx.send("📌 출석", view=AttendanceView(members))
 
 @bot.command()
 async def 추가(ctx, name: str):
@@ -190,19 +230,35 @@ async def 삭제(ctx, name: str):
     remove_member(name)
     await ctx.send(f"{name} 삭제 완료")
 
+# =========================
+# 🔥 주간 점수 추가 (핵심)
+# =========================
 @bot.command()
-async def 랭킹(ctx):
-    cursor.execute("SELECT name, total FROM members ORDER BY total DESC")
+async def 주간(ctx):
+    start = (datetime.now(KST) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    cursor.execute("""
+        SELECT name, COUNT(*) 
+        FROM attendance 
+        WHERE date >= ?
+        GROUP BY name
+        ORDER BY COUNT(*) DESC
+    """, (start,))
+
     rows = cursor.fetchall()
 
-    text = "🏆 랭킹\n\n"
+    if not rows:
+        await ctx.send("데이터 없음")
+        return
+
+    text = "📊 주간 출석 점수\n\n"
     for i, r in enumerate(rows, 1):
-        text += f"{i}. {r[0]} - {r[1]}회\n"
+        text += f"{i}. {r[0]} - {r[1]}점\n"
 
     await ctx.send(text)
 
 # =========================
-# 🔥 자동 10분 전 패널
+# 🔥 자동 패널 (기존 유지)
 # =========================
 async def auto_panel_10min():
     await bot.wait_until_ready()
@@ -210,18 +266,12 @@ async def auto_panel_10min():
     notified = set()
 
     while not bot.is_closed():
-        now = datetime.now()
+        now = datetime.now(KST)
         today = now.strftime("%Y-%m-%d")
 
-        schedule = {
-            3: "03",
-            9: "09",
-            15: "15",
-            21: "21"
-        }
+        schedule = {3:"03", 9:"09", 15:"15", 21:"21"}
 
         for hour, slot in schedule.items():
-
             if now.hour == hour and now.minute == 50:
 
                 key = f"{today}-{slot}"
@@ -233,12 +283,9 @@ async def auto_panel_10min():
 
                 if channel:
                     members = get_members()
+                    text = f"⏰ {slot}시 출석 10분 전\n\n" + "\n".join(members)
 
-                    if members:
-                        text = f"⏰ {slot}시 출석 10분 전\n\n"
-                        text += "\n".join(members)
-
-                        await channel.send(text, view=AttendanceView())
+                    await channel.send(text, view=AttendanceView(members))
 
                 notified.add(key)
 
@@ -248,7 +295,7 @@ async def auto_panel_10min():
         await asyncio.sleep(30)
 
 # =========================
-# 🔹 실행
+# 🔥 실행
 # =========================
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
