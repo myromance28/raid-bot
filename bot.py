@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 from threading import Thread
+import asyncio
 import threading
 
 # =========================
@@ -50,7 +51,6 @@ CREATE TABLE IF NOT EXISTS members (
 """)
 
 conn.commit()
-
 db_lock = threading.Lock()
 
 # =========================
@@ -58,7 +58,6 @@ db_lock = threading.Lock()
 # =========================
 def get_slot():
     hour = datetime.now(KST).hour
-
     if 0 <= hour < 6:
         return "21"
     elif 6 <= hour < 12:
@@ -69,7 +68,7 @@ def get_slot():
         return "15"
 
 # =========================
-# 🔹 멤버
+# 🔹 이름 관리
 # =========================
 def add_member(name):
     with db_lock:
@@ -94,52 +93,31 @@ def attend(name):
     slot = get_slot()
 
     with db_lock:
-        cursor.execute(
-            "SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?",
-            (date, slot, name)
-        )
-
+        cursor.execute("SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
         if cursor.fetchone():
             return "already"
-
-        cursor.execute(
-            "INSERT INTO attendance VALUES (?, ?, ?)",
-            (date, slot, name)
-        )
-
+        cursor.execute("INSERT INTO attendance VALUES (?, ?, ?)", (date, slot, name))
         cursor.execute("""
             INSERT INTO members(name, total)
             VALUES(?, 1)
             ON CONFLICT(name)
             DO UPDATE SET total = total + 1
         """, (name,))
-
         conn.commit()
-
     return "ok"
 
 def cancel(name):
     date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
-
     with db_lock:
-        cursor.execute(
-            "DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?",
-            (date, slot, name)
-        )
+        cursor.execute("DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
         conn.commit()
-
     return "ok"
 
 def is_attended(name):
     date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
-
-    cursor.execute(
-        "SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?",
-        (date, slot, name)
-    )
-
+    cursor.execute("SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
     return cursor.fetchone() is not None
 
 # =========================
@@ -147,30 +125,14 @@ def is_attended(name):
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 UI (완전 최종 핵심)
-# =========================
-class AttendanceView(discord.ui.View):
-    def __init__(self, members):
-        super().__init__(timeout=None)
-
-        # 👉 전체 인원 출력 (제한 없음)
-        for i, name in enumerate(members):
-            self.add_item(AttendButton(name, row=i))
-            self.add_item(CancelButton(name, row=i))
-
-# =========================
-# 🔥 버튼
+# 🔥 버튼 (세로 정렬, 안정화)
 # =========================
 class AttendButton(discord.ui.Button):
-    def __init__(self, name, row):
+    def __init__(self, name, row, done=False):
         self.name = name
-
-        done = is_attended(name)
-
         super().__init__(
             label=name,
             style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
@@ -180,7 +142,6 @@ class AttendButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         attend(self.name)
-
         members = get_members()
         await interaction.response.edit_message(
             content="📌 출석 패널",
@@ -189,74 +150,74 @@ class AttendButton(discord.ui.Button):
 
 class CancelButton(discord.ui.Button):
     def __init__(self, name, row):
+        super().__init__(label="취소", style=discord.ButtonStyle.red, row=row)
         self.name = name
-
-        super().__init__(
-            label="취소",
-            style=discord.ButtonStyle.red,
-            row=row
-        )
 
     async def callback(self, interaction: discord.Interaction):
         cancel(self.name)
-
         members = get_members()
         await interaction.response.edit_message(
             content="📌 출석 패널",
             view=AttendanceView(members)
         )
 
+class AttendanceView(discord.ui.View):
+    def __init__(self, members):
+        super().__init__(timeout=None)
+        members = members[:30]  # 최대 30명
+        attended_map = {name: is_attended(name) for name in members}
+        for i, name in enumerate(members):
+            self.add_item(AttendButton(name, row=i, done=attended_map[name]))
+            self.add_item(CancelButton(name, row=i))
+
 # =========================
-# 🔹 명령어
+# 🔥 명령어
 # =========================
 @bot.command()
 async def 출석(ctx):
     members = get_members()
-
     if not members:
         await ctx.send("등록된 인원 없음")
         return
-
-    await ctx.send(
-        "📌 출석 패널",
-        view=AttendanceView(members)
-    )
+    view = AttendanceView(members)
+    await ctx.send("📌 출석 패널", view=view)
 
 @bot.command()
-async def 추가(ctx, *, names):
-    for n in names.split(","):
-        add_member(n.strip())
-
-    await ctx.send("추가 완료")
+async def 추가(ctx, *, names: str):
+    for name in names.replace(" ", "").split(","):
+        add_member(name)
+    await ctx.send(f"{names} 추가 완료")
 
 @bot.command()
 async def 삭제(ctx, name: str):
     remove_member(name)
-    await ctx.send("삭제 완료")
+    await ctx.send(f"{name} 삭제 완료")
 
 @bot.command()
 async def 명단(ctx):
     members = get_members()
-    await ctx.send("\n".join(members) if members else "없음")
+    if not members:
+        await ctx.send("등록된 인원 없음")
+        return
+    await ctx.send("📋 등록된 명단\n" + "\n".join(members))
 
 @bot.command()
 async def 주간(ctx):
     start = (datetime.now(KST) - timedelta(days=6)).strftime("%Y-%m-%d")
-
     cursor.execute("""
-        SELECT name, COUNT(*)
-        FROM attendance
+        SELECT name, COUNT(*) 
+        FROM attendance 
         WHERE date >= ?
         GROUP BY name
         ORDER BY COUNT(*) DESC
     """, (start,))
-
     rows = cursor.fetchall()
-
-    text = "📊 주간 점수\n\n"
+    if not rows:
+        await ctx.send("데이터 없음")
+        return
+    text = "📊 주간 출석 점수\n\n"
     for i, r in enumerate(rows, 1):
         text += f"{i}. {r[0]} - {r[1]}점\n"
-
     await ctx.send(text)
 
 # =========================
