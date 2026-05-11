@@ -74,12 +74,18 @@ def get_slot():
 # =========================
 def add_member(name):
     with db_lock:
-        cursor.execute("INSERT OR IGNORE INTO members(name, total) VALUES(?, 0)", (name,))
+        cursor.execute(
+            "INSERT OR IGNORE INTO members(name, total) VALUES(?, 0)",
+            (name,)
+        )
         conn.commit()
 
 def remove_member(name):
     with db_lock:
-        cursor.execute("DELETE FROM members WHERE name=?", (name,))
+        cursor.execute(
+            "DELETE FROM members WHERE name=?",
+            (name,)
+        )
         conn.commit()
 
 def get_members():
@@ -133,14 +139,6 @@ def cancel(name):
     return "ok"
 
 # =========================
-# 🔹 봇
-# =========================
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# =========================
 # 🔹 상태 체크
 # =========================
 def is_attended(name):
@@ -155,7 +153,15 @@ def is_attended(name):
     return cursor.fetchone() is not None
 
 # =========================
-# 🔥 버튼 (핵심 수정 완료)
+# 🔹 Discord Bot
+# =========================
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# =========================
+# 🔥 버튼
 # =========================
 class AttendButton(discord.ui.Button):
     def __init__(self, name, row):
@@ -170,35 +176,45 @@ class AttendButton(discord.ui.Button):
             disabled=done
         )
 
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
         result = attend(self.member_name)
 
         if result == "already":
-            await interaction.response.send_message("이미 출석됨", ephemeral=True)
+            await interaction.response.send_message(
+                "이미 출석됨",
+                ephemeral=True
+            )
             return
 
-        # 🔥 출석 후 UI 즉시 갱신
         members = get_members()
+
         await interaction.response.edit_message(
-            content="📌 출석 패널 (업데이트됨)",
+            content="📌 출석 패널",
             view=AttendanceView(members)
         )
 
 class CancelButton(discord.ui.Button):
     def __init__(self, name, row):
+        self.member_name = name
+
         super().__init__(
             label="취소",
             style=discord.ButtonStyle.red,
             row=row
         )
-        self.member_name = name
 
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
         cancel(self.member_name)
-        await interaction.response.send_message(f"{self.member_name} 취소 완료", ephemeral=True)
+
+        members = get_members()
+
+        await interaction.response.edit_message(
+            content="📌 출석 패널",
+            view=AttendanceView(members)
+        )
 
 # =========================
-# 🔥 View (세로 정렬)
+# 🔥 View
 # =========================
 class AttendanceView(discord.ui.View):
     def __init__(self, members):
@@ -211,6 +227,7 @@ class AttendanceView(discord.ui.View):
 # =========================
 # 🔥 명령어
 # =========================
+
 @bot.command()
 async def 출석(ctx):
     members = get_members()
@@ -219,12 +236,25 @@ async def 출석(ctx):
         await ctx.send("등록된 인원 없음")
         return
 
-    await ctx.send("📌 출석 패널", view=AttendanceView(members))
+    view = AttendanceView(members)
+
+    await ctx.channel.send(
+        content="📌 출석 패널",
+        view=view
+    )
 
 @bot.command()
-async def 추가(ctx, name: str):
-    add_member(name)
-    await ctx.send(f"{name} 추가 완료")
+async def 추가(ctx, *, names):
+    name_list = [n.strip() for n in names.split(",")]
+
+    added = []
+
+    for name in name_list:
+        if name:
+            add_member(name)
+            added.append(name)
+
+    await ctx.send(f"추가 완료: {', '.join(added)}")
 
 @bot.command()
 async def 삭제(ctx, name: str):
@@ -232,12 +262,31 @@ async def 삭제(ctx, name: str):
     await ctx.send(f"{name} 삭제 완료")
 
 @bot.command()
+async def 명단(ctx):
+    members = get_members()
+
+    if not members:
+        await ctx.send("등록된 인원 없음")
+        return
+
+    text = "📋 등록 명단\n\n"
+
+    for i, name in enumerate(members, 1):
+        text += f"{i}. {name}\n"
+
+    await ctx.send(text)
+
+@bot.command()
 async def 주간(ctx):
-    start = (datetime.now(KST) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    today = datetime.now(KST)
+    monday = today - timedelta(days=today.weekday())
+
+    start = monday.strftime("%Y-%m-%d")
 
     cursor.execute("""
-        SELECT name, COUNT(*) 
-        FROM attendance 
+        SELECT name, COUNT(*)
+        FROM attendance
         WHERE date >= ?
         GROUP BY name
         ORDER BY COUNT(*) DESC
@@ -250,13 +299,96 @@ async def 주간(ctx):
         return
 
     text = "📊 주간 출석 점수\n\n"
+
     for i, r in enumerate(rows, 1):
         text += f"{i}. {r[0]} - {r[1]}점\n"
 
     await ctx.send(text)
 
 # =========================
+# 🔥 자동 출석 패널
+# =========================
+async def auto_attendance_panel():
+    await bot.wait_until_ready()
+
+    sent_times = set()
+    weekly_sent = False
+
+    while not bot.is_closed():
+        now = datetime.now(KST)
+
+        current = now.strftime("%H:%M")
+
+        # 🔥 10분 전 알림
+        target_times = ["02:50", "08:50", "14:50", "20:50"]
+
+        if current in target_times and current not in sent_times:
+
+            members = get_members()
+
+            if members:
+                for guild in bot.guilds:
+                    for channel in guild.text_channels:
+
+                        try:
+                            await channel.send(
+                                "📌 자동 출석 패널",
+                                view=AttendanceView(members)
+                            )
+                            break
+                        except:
+                            pass
+
+            sent_times.add(current)
+
+        # 🔥 일요일 21:00 주간 자동 출력
+        if now.weekday() == 6 and current == "21:00" and not weekly_sent:
+
+            today = datetime.now(KST)
+            monday = today - timedelta(days=today.weekday())
+
+            start = monday.strftime("%Y-%m-%d")
+
+            cursor.execute("""
+                SELECT name, COUNT(*)
+                FROM attendance
+                WHERE date >= ?
+                GROUP BY name
+                ORDER BY COUNT(*) DESC
+            """, (start,))
+
+            rows = cursor.fetchall()
+
+            text = "🏆 주간 최종 출석 점수\n\n"
+
+            for i, r in enumerate(rows, 1):
+                text += f"{i}. {r[0]} - {r[1]}점\n"
+
+            for guild in bot.guilds:
+                for channel in guild.text_channels:
+
+                    try:
+                        await channel.send(text)
+                        break
+                    except:
+                        pass
+
+            weekly_sent = True
+
+        # 🔥 월요일 초기화
+        if now.weekday() == 0 and current == "00:00":
+            weekly_sent = False
+            sent_times.clear()
+
+        await asyncio.sleep(30)
+
+# =========================
 # 🔥 실행
 # =========================
+@bot.event
+async def on_ready():
+    bot.loop.create_task(auto_attendance_panel())
+    print(f"{bot.user} 로그인 완료")
+
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
