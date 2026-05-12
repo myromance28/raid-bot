@@ -127,37 +127,42 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 버튼 (세로 정렬, 안정화)
+# 🔥 버튼 (row 제거)
 # =========================
 class AttendButton(discord.ui.Button):
-    def __init__(self, name, row, done=False):
+    def __init__(self, name, done=False):
         self.name = name
         super().__init__(
             label=name,
             style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
-            disabled=done,
-            row=row
+            disabled=done
         )
 
     async def callback(self, interaction: discord.Interaction):
         attend(self.name)
         members = get_members()
         await interaction.response.edit_message(
-            content="📌 출석 패널",
-            view=PaginatedAttendanceView(members, self.view.page)
+            content="📌 출석 패널 (페이지 {}/{})".format(
+                getattr(self.view, "page", 0)+1,
+                getattr(self.view, "max_page", 0)+1
+            ),
+            view=PaginatedAttendanceView(members, getattr(self.view, "page", 0))
         )
 
 class CancelButton(discord.ui.Button):
-    def __init__(self, name, row):
-        super().__init__(label="취소", style=discord.ButtonStyle.red, row=row)
+    def __init__(self, name):
+        super().__init__(label="취소", style=discord.ButtonStyle.red)
         self.name = name
 
     async def callback(self, interaction: discord.Interaction):
         cancel(self.name)
         members = get_members()
         await interaction.response.edit_message(
-            content="📌 출석 패널",
-            view=PaginatedAttendanceView(members, self.view.page)
+            content="📌 출석 패널 (페이지 {}/{})".format(
+                getattr(self.view, "page", 0)+1,
+                getattr(self.view, "max_page", 0)+1
+            ),
+            view=PaginatedAttendanceView(members, getattr(self.view, "page", 0))
         )
 
 # =========================
@@ -173,19 +178,17 @@ class PaginatedAttendanceView(discord.ui.View):
         self.update_buttons()
 
     def update_buttons(self):
-        self.clear_items()  # 기존 버튼 초기화
-
+        self.clear_items()
         start = self.page * self.per_page
         end = start + self.per_page
         page_members = self.members[start:end]
         attended_map = {name: is_attended(name) for name in page_members}
 
-        # 출석 + 취소 버튼 추가
-        for i, name in enumerate(page_members):
-            self.add_item(AttendButton(name, row=i, done=attended_map[name]))
-            self.add_item(CancelButton(name, row=i))
+        for name in page_members:
+            self.add_item(AttendButton(name, done=attended_map[name]))
+            self.add_item(CancelButton(name))
 
-        # 페이지 이동 버튼 추가
+        # 페이지 이동 버튼
         if self.max_page > 0:
             if self.page > 0:
                 self.add_item(PageButton("◀ 이전", self, self.page - 1))
@@ -218,7 +221,7 @@ async def 출석(ctx):
         await ctx.send("등록된 인원 없음")
         return
     view = PaginatedAttendanceView(members)
-    await ctx.send(f"📌 출석 패널 (페이지 1/{max((len(members)-1)//20 +1,1)})", view=view)
+    await ctx.send(f"📌 출석 패널 (페이지 1/{max((len(members)-1)//10 +1,1)})", view=view)
 
 @bot.command()
 async def 추가(ctx, *, names: str):
