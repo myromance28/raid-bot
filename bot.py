@@ -446,20 +446,42 @@ async def 명단(ctx):
         "📋 등록된 명단\n" + "\n".join(members)
     )
 
+# =========================
+# 🔹 주간 집계
+# =========================
 @bot.command()
 async def 주간(ctx):
 
-    start = (
-        datetime.now(KST) - timedelta(days=6)
-    ).strftime("%Y-%m-%d")
+    now = datetime.now(KST)
+
+    # 이번주 월요일 00:00
+    monday = now - timedelta(days=now.weekday())
+
+    week_start = monday.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    # 이번주 일요일 23:59:59
+    week_end = week_start + timedelta(
+        days=6,
+        hours=23,
+        minutes=59,
+        seconds=59
+    )
 
     cursor.execute("""
         SELECT name, COUNT(*)
         FROM attendance
-        WHERE date >= ?
+        WHERE date BETWEEN ? AND ?
         GROUP BY name
         ORDER BY COUNT(*) DESC
-    """, (start,))
+    """, (
+        week_start.strftime("%Y-%m-%d"),
+        week_end.strftime("%Y-%m-%d")
+    ))
 
     rows = cursor.fetchall()
 
@@ -467,7 +489,11 @@ async def 주간(ctx):
         await ctx.send("데이터 없음")
         return
 
-    text = "📊 주간 출석 점수\n\n"
+    text = (
+        f"📊 주간 출석 점수\n"
+        f"({week_start.strftime('%m/%d')} ~ "
+        f"{week_end.strftime('%m/%d')})\n\n"
+    )
 
     for i, r in enumerate(rows, 1):
         text += f"{i}. {r[0]} - {r[1]}점\n"
