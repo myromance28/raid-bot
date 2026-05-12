@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -31,6 +31,11 @@ def keep_alive():
     Thread(target=run).start()
 
 # =========================
+# 🔹 보스 출석 채널
+# =========================
+BOSS_CHANNEL_ID = 1503420212794622073
+
+# =========================
 # 🔹 DB
 # =========================
 conn = sqlite3.connect("data.db", check_same_thread=False)
@@ -59,6 +64,7 @@ db_lock = threading.Lock()
 # =========================
 def get_slot():
     hour = datetime.now(KST).hour
+
     if 0 <= hour < 6:
         return "21"
     elif 6 <= hour < 12:
@@ -73,173 +79,415 @@ def get_slot():
 # =========================
 def add_member(name):
     with db_lock:
-        cursor.execute("INSERT OR IGNORE INTO members(name, total) VALUES(?, 0)", (name,))
+        cursor.execute(
+            "INSERT OR IGNORE INTO members(name, total) VALUES(?, 0)",
+            (name,)
+        )
         conn.commit()
 
 def remove_member(name):
     with db_lock:
-        cursor.execute("DELETE FROM members WHERE name=?", (name,))
+        cursor.execute(
+            "DELETE FROM members WHERE name=?",
+            (name,)
+        )
         conn.commit()
 
 def get_members():
     with db_lock:
-        cursor.execute("SELECT name FROM members ORDER BY name ASC")
+        cursor.execute(
+            "SELECT name FROM members ORDER BY name ASC"
+        )
         return [r[0] for r in cursor.fetchall()]
 
 # =========================
 # 🔹 출석
 # =========================
 def attend(name):
+
     date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
 
     with db_lock:
-        cursor.execute("SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
+
+        cursor.execute(
+            "SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            (date, slot, name)
+        )
+
         if cursor.fetchone():
             return "already"
-        cursor.execute("INSERT INTO attendance VALUES (?, ?, ?)", (date, slot, name))
+
+        cursor.execute(
+            "INSERT INTO attendance VALUES (?, ?, ?)",
+            (date, slot, name)
+        )
+
         cursor.execute("""
             INSERT INTO members(name, total)
             VALUES(?, 1)
             ON CONFLICT(name)
             DO UPDATE SET total = total + 1
         """, (name,))
+
         conn.commit()
+
     return "ok"
 
-def is_attended(name):
+def cancel_attend(name):
+
     date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
-    cursor.execute("SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
-    return cursor.fetchone() is not None
+
+    with db_lock:
+
+        cursor.execute(
+            "DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            (date, slot, name)
+        )
+
+        cursor.execute("""
+            UPDATE members
+            SET total = CASE
+                WHEN total > 0 THEN total - 1
+                ELSE 0
+            END
+            WHERE name=?
+        """, (name,))
+
+        conn.commit()
+
+def is_attended(name):
+
+    date = datetime.now(KST).strftime("%Y-%m-%d")
+    slot = get_slot()
+
+    with db_lock:
+
+        cursor.execute(
+            "SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?",
+            (date, slot, name)
+        )
+
+        return cursor.fetchone() is not None
+
+# =========================
+# 🔹 다음 보스타임 계산
+# =========================
+BOSS_TIMES = [3, 9, 15, 21]
+
+def get_next_boss_time():
+
+    now = datetime.now(KST)
+
+    today = now.date()
+
+    candidates = []
+
+    for h in BOSS_TIMES:
+
+        candidates.append(
+            datetime.combine(
+                today,
+                datetime.min.time(),
+                tzinfo=KST
+            ).replace(
+                hour=h,
+                minute=0,
+                second=0
+            )
+        )
+
+    tomorrow = today + timedelta(days=1)
+
+    candidates.append(
+        datetime.combine(
+            tomorrow,
+            datetime.min.time(),
+            tzinfo=KST
+        ).replace(
+            hour=3,
+            minute=0,
+            second=0
+        )
+    )
+
+    for t in candidates:
+        if t > now:
+            return t
 
 # =========================
 # 🔹 봇
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
 
 # =========================
-# 🔹 페이지형 버튼 (취소 버튼 제거)
+# 🔹 출석 버튼
 # =========================
 class ToggleAttendButton(discord.ui.Button):
+
     def __init__(self, name):
-        self.name = name
+
+        self.member_name = name
+
         done = is_attended(name)
+
         super().__init__(
             label=name,
-            style=discord.ButtonStyle.green if not done else discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
+            row=None
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if is_attended(self.name):
-            # 이미 출석 → 취소
-            date = datetime.now(KST).strftime("%Y-%m-%d")
-            slot = get_slot()
-            with db_lock:
-                cursor.execute("DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, self.name))
-                conn.commit()
+
+        if is_attended(self.member_name):
+
+            cancel_attend(self.member_name)
+
             self.style = discord.ButtonStyle.green
+
         else:
-            attend(self.name)
+
+            attend(self.member_name)
+
             self.style = discord.ButtonStyle.secondary
-        await interaction.response.edit_message(content="📌 출석 패널", view=self.view)
 
+        await interaction.response.edit_message(
+            content=interaction.message.content,
+            view=self.view
+        )
+
+# =========================
+# 🔹 페이지 View
+# =========================
 class ToggleAttendanceView(discord.ui.View):
-    def __init__(self, members, per_page=20):  # 한 페이지 20명
-        super().__init__(timeout=None)
-        self.members = members  # 모든 멤버 표시
-        self.per_page = per_page
-        self.current_page = 0
-        self.total_pages = (len(self.members) + per_page - 1) // per_page
-        self.build_page(self.current_page)
 
-    def build_page(self, page):
+    def __init__(self, members, per_page=20):
+
+        super().__init__(timeout=None)
+
+        self.members = members
+        self.per_page = per_page
+
+        self.current_page = 0
+
+        self.total_pages = max(
+            1,
+            (len(self.members) + self.per_page - 1) // self.per_page
+        )
+
+        self.build_page()
+
+    def build_page(self):
+
         self.clear_items()
-        start = page * self.per_page
-        end = min(start + self.per_page, len(self.members))
+
+        start = self.current_page * self.per_page
+        end = start + self.per_page
+
         page_members = self.members[start:end]
 
+        # 사람 버튼
         for name in page_members:
             self.add_item(ToggleAttendButton(name))
 
+        # 페이지 버튼
         if self.total_pages > 1:
-            self.add_item(self.PreviousButton(self))
-            self.add_item(self.NextButton(self))
 
-    class PreviousButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="◀ 이전", style=discord.ButtonStyle.gray)
-            self.attendance_view = parent_view
+            prev_btn = discord.ui.Button(
+                label="◀ 이전",
+                style=discord.ButtonStyle.gray,
+                row=4
+            )
 
-        async def callback(self, interaction: discord.Interaction):
-            self.attendance_view.current_page = (self.attendance_view.current_page - 1) % self.attendance_view.total_pages
-            self.attendance_view.build_page(self.attendance_view.current_page)
-            await interaction.response.edit_message(content="📌 출석 패널", view=self.attendance_view)
+            async def prev_callback(interaction: discord.Interaction):
 
-    class NextButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="다음 ▶", style=discord.ButtonStyle.gray)
-            self.attendance_view = parent_view
+                self.current_page -= 1
 
-        async def callback(self, interaction: discord.Interaction):
-            self.attendance_view.current_page = (self.attendance_view.current_page + 1) % self.attendance_view.total_pages
-            self.attendance_view.build_page(self.attendance_view.current_page)
-            await interaction.response.edit_message(content="📌 출석 패널", view=self.attendance_view)
+                if self.current_page < 0:
+                    self.current_page = self.total_pages - 1
+
+                self.build_page()
+
+                await interaction.response.edit_message(
+                    content=interaction.message.content,
+                    view=self
+                )
+
+            prev_btn.callback = prev_callback
+
+            self.add_item(prev_btn)
+
+            page_btn = discord.ui.Button(
+                label=f"{self.current_page + 1}/{self.total_pages}",
+                style=discord.ButtonStyle.blurple,
+                disabled=True,
+                row=4
+            )
+
+            self.add_item(page_btn)
+
+            next_btn = discord.ui.Button(
+                label="다음 ▶",
+                style=discord.ButtonStyle.gray,
+                row=4
+            )
+
+            async def next_callback(interaction: discord.Interaction):
+
+                self.current_page += 1
+
+                if self.current_page >= self.total_pages:
+                    self.current_page = 0
+
+                self.build_page()
+
+                await interaction.response.edit_message(
+                    content=interaction.message.content,
+                    view=self
+                )
+
+            next_btn.callback = next_callback
+
+            self.add_item(next_btn)
+
+# =========================
+# 🔹 자동 보스 출석패널
+# =========================
+@tasks.loop(minutes=1)
+async def auto_boss_panel():
+
+    now = datetime.now(KST)
+
+    next_boss = get_next_boss_time()
+
+    target = next_boss - timedelta(minutes=10)
+
+    if (
+        now.year == target.year and
+        now.month == target.month and
+        now.day == target.day and
+        now.hour == target.hour and
+        now.minute == target.minute
+    ):
+
+        channel = bot.get_channel(BOSS_CHANNEL_ID)
+
+        if channel is None:
+            return
+
+        members = get_members()
+
+        if not members:
+            return
+
+        view = ToggleAttendanceView(members)
+
+        title = (
+            f"{next_boss.month}월{next_boss.day}일_"
+            f"{next_boss.hour}:00 보스타임 출석패널"
+        )
+
+        await channel.send(
+            title,
+            view=view
+        )
 
 # =========================
 # 🔹 명령어
 # =========================
 @bot.command()
 async def 출석(ctx):
+
     members = get_members()
+
     if not members:
         await ctx.send("등록된 인원 없음")
         return
+
     view = ToggleAttendanceView(members)
-    await ctx.send("📌 출석 패널", view=view)
+
+    await ctx.send(
+        f"📌 출석 패널 (1/{view.total_pages})",
+        view=view
+    )
 
 @bot.command()
 async def 추가(ctx, *, names: str):
+
     for name in names.replace(" ", "").split(","):
         add_member(name)
+
     await ctx.send(f"{names} 추가 완료")
 
 @bot.command()
 async def 삭제(ctx, name: str):
+
     remove_member(name)
+
     await ctx.send(f"{name} 삭제 완료")
 
 @bot.command()
 async def 명단(ctx):
+
     members = get_members()
+
     if not members:
         await ctx.send("등록된 인원 없음")
         return
-    await ctx.send("📋 등록된 명단\n" + "\n".join(members))
+
+    await ctx.send(
+        "📋 등록된 명단\n" + "\n".join(members)
+    )
 
 @bot.command()
 async def 주간(ctx):
-    start = (datetime.now(KST) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    start = (
+        datetime.now(KST) - timedelta(days=6)
+    ).strftime("%Y-%m-%d")
+
     cursor.execute("""
-        SELECT name, COUNT(*) 
-        FROM attendance 
+        SELECT name, COUNT(*)
+        FROM attendance
         WHERE date >= ?
         GROUP BY name
         ORDER BY COUNT(*) DESC
     """, (start,))
+
     rows = cursor.fetchall()
+
     if not rows:
         await ctx.send("데이터 없음")
         return
+
     text = "📊 주간 출석 점수\n\n"
+
     for i, r in enumerate(rows, 1):
         text += f"{i}. {r[0]} - {r[1]}점\n"
+
     await ctx.send(text)
+
+# =========================
+# 🔹 준비 완료
+# =========================
+@bot.event
+async def on_ready():
+
+    print(f"로그인 완료 : {bot.user}")
+
+    if not auto_boss_panel.is_running():
+        auto_boss_panel.start()
 
 # =========================
 # 🔹 실행
 # =========================
 keep_alive()
+
 bot.run(os.getenv("DISCORD_TOKEN"))
