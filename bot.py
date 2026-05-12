@@ -7,6 +7,8 @@ from flask import Flask
 from threading import Thread
 import threading
 
+print("Token loaded:", os.getenv("DISCORD_TOKEN") is not None)
+
 # =========================
 # 🔹 KST
 # =========================
@@ -105,14 +107,6 @@ def attend(name):
         conn.commit()
     return "ok"
 
-def cancel(name):
-    date = datetime.now(KST).strftime("%Y-%m-%d")
-    slot = get_slot()
-    with db_lock:
-        cursor.execute("DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
-        conn.commit()
-    return "ok"
-
 def is_attended(name):
     date = datetime.now(KST).strftime("%Y-%m-%d")
     slot = get_slot()
@@ -127,92 +121,75 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# 🔥 버튼 (row 제거)
+# 🔹 페이지형 버튼 (취소 버튼 제거)
 # =========================
-class AttendButton(discord.ui.Button):
-    def __init__(self, name, done=False):
+class ToggleAttendButton(discord.ui.Button):
+    def __init__(self, name):
         self.name = name
+        done = is_attended(name)
         super().__init__(
             label=name,
-            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green,
-            disabled=done
+            style=discord.ButtonStyle.green if not done else discord.ButtonStyle.secondary,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        attend(self.name)
-        members = get_members()
-        await interaction.response.edit_message(
-            content="📌 출석 패널 (페이지 {}/{})".format(
-                getattr(self.view, "page", 0)+1,
-                getattr(self.view, "max_page", 0)+1
-            ),
-            view=PaginatedAttendanceView(members, getattr(self.view, "page", 0))
-        )
+        if is_attended(self.name):
+            # 이미 출석 → 취소
+            date = datetime.now(KST).strftime("%Y-%m-%d")
+            slot = get_slot()
+            with db_lock:
+                cursor.execute("DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, self.name))
+                conn.commit()
+            self.style = discord.ButtonStyle.green
+        else:
+            attend(self.name)
+            self.style = discord.ButtonStyle.secondary
+        await interaction.response.edit_message(content="📌 출석 패널", view=self.view)
 
-class CancelButton(discord.ui.Button):
-    def __init__(self, name):
-        super().__init__(label="취소", style=discord.ButtonStyle.red)
-        self.name = name
-
-    async def callback(self, interaction: discord.Interaction):
-        cancel(self.name)
-        members = get_members()
-        await interaction.response.edit_message(
-            content="📌 출석 패널 (페이지 {}/{})".format(
-                getattr(self.view, "page", 0)+1,
-                getattr(self.view, "max_page", 0)+1
-            ),
-            view=PaginatedAttendanceView(members, getattr(self.view, "page", 0))
-        )
-
-# =========================
-# 🔹 페이지형 출석 패널
-# =========================
-class PaginatedAttendanceView(discord.ui.View):
-    def __init__(self, members, page=0):
+class ToggleAttendanceView(discord.ui.View):
+    def __init__(self, members, per_page=20):  # 한 페이지 20명
         super().__init__(timeout=None)
-        self.members = members
-        self.page = page
-        self.per_page = 10  # 페이지당 최대 10명
-        self.max_page = (len(members) - 1) // self.per_page
-        self.update_buttons()
+        self.members = members  # 모든 멤버 표시
+        self.per_page = per_page
+        self.current_page = 0
+        self.total_pages = (len(self.members) + per_page - 1) // per_page
+        self.build_page(self.current_page)
 
-    def update_buttons(self):
+    def build_page(self, page):
         self.clear_items()
-        start = self.page * self.per_page
-        end = start + self.per_page
+        start = page * self.per_page
+        end = min(start + self.per_page, len(self.members))
         page_members = self.members[start:end]
-        attended_map = {name: is_attended(name) for name in page_members}
 
         for name in page_members:
-            self.add_item(AttendButton(name, done=attended_map[name]))
-            self.add_item(CancelButton(name))
+            self.add_item(ToggleAttendButton(name))
 
-        # 페이지 이동 버튼
-        if self.max_page > 0:
-            if self.page > 0:
-                self.add_item(PageButton("◀ 이전", self, self.page - 1))
-            if self.page < self.max_page:
-                self.add_item(PageButton("다음 ▶", self, self.page + 1))
+        if self.total_pages > 1:
+            self.add_item(self.PreviousButton(self))
+            self.add_item(self.NextButton(self))
 
-class PageButton(discord.ui.Button):
-    def __init__(self, label, view, target_page):
-        super().__init__(label=label, style=discord.ButtonStyle.blurple)
-        self.view_ref = view
-        self.target_page = target_page
+    class PreviousButton(discord.ui.Button):
+        def __init__(self, parent_view):
+            super().__init__(label="◀ 이전", style=discord.ButtonStyle.gray)
+            self.attendance_view = parent_view
 
-    async def callback(self, interaction: discord.Interaction):
-        self.view_ref.page = self.target_page
-        self.view_ref.update_buttons()
-        await interaction.response.edit_message(
-            content="📌 출석 패널 (페이지 {}/{})".format(
-                self.view_ref.page + 1, self.view_ref.max_page + 1
-            ),
-            view=self.view_ref
-        )
+        async def callback(self, interaction: discord.Interaction):
+            self.attendance_view.current_page = (self.attendance_view.current_page - 1) % self.attendance_view.total_pages
+            self.attendance_view.build_page(self.attendance_view.current_page)
+            await interaction.response.edit_message(content="📌 출석 패널", view=self.attendance_view)
+
+    class NextButton(discord.ui.Button):
+        def __init__(self, parent_view):
+            super().__init__(label="다음 ▶", style=discord.ButtonStyle.gray)
+            self.attendance_view = parent_view
+
+        async def callback(self, interaction: discord.Interaction):
+            self.attendance_view.current_page = (self.attendance_view.current_page + 1) % self.attendance_view.total_pages
+            self.attendance_view.build_page(self.attendance_view.current_page)
+            await interaction.response.edit_message(content="📌 출석 패널", view=self.attendance_view)
 
 # =========================
-# 🔥 명령어
+# 🔹 명령어
 # =========================
 @bot.command()
 async def 출석(ctx):
@@ -220,8 +197,8 @@ async def 출석(ctx):
     if not members:
         await ctx.send("등록된 인원 없음")
         return
-    view = PaginatedAttendanceView(members)
-    await ctx.send(f"📌 출석 패널 (페이지 1/{max((len(members)-1)//10 +1,1)})", view=view)
+    view = ToggleAttendanceView(members)
+    await ctx.send("📌 출석 패널", view=view)
 
 @bot.command()
 async def 추가(ctx, *, names: str):
@@ -262,7 +239,7 @@ async def 주간(ctx):
     await ctx.send(text)
 
 # =========================
-# 🔥 실행
+# 🔹 실행
 # =========================
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
