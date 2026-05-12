@@ -5,7 +5,6 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 from threading import Thread
-import asyncio
 import threading
 
 # =========================
@@ -145,7 +144,7 @@ class AttendButton(discord.ui.Button):
         members = get_members()
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=AttendanceView(members)
+            view=PaginatedAttendanceView(members, self.view.page)
         )
 
 class CancelButton(discord.ui.Button):
@@ -158,17 +157,56 @@ class CancelButton(discord.ui.Button):
         members = get_members()
         await interaction.response.edit_message(
             content="📌 출석 패널",
-            view=AttendanceView(members)
+            view=PaginatedAttendanceView(members, self.view.page)
         )
 
-class AttendanceView(discord.ui.View):
-    def __init__(self, members):
+# =========================
+# 🔹 페이지형 출석 패널
+# =========================
+class PaginatedAttendanceView(discord.ui.View):
+    def __init__(self, members, page=0):
         super().__init__(timeout=None)
-        members = members[:30]  # 최대 30명
-        attended_map = {name: is_attended(name) for name in members}
-        for i, name in enumerate(members):
+        self.members = members
+        self.page = page
+        self.per_page = 20  # 페이지당 최대 20명
+        self.max_page = (len(members) - 1) // self.per_page
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()  # 기존 버튼 초기화
+
+        start = self.page * self.per_page
+        end = start + self.per_page
+        page_members = self.members[start:end]
+        attended_map = {name: is_attended(name) for name in page_members}
+
+        # 출석 + 취소 버튼 추가
+        for i, name in enumerate(page_members):
             self.add_item(AttendButton(name, row=i, done=attended_map[name]))
             self.add_item(CancelButton(name, row=i))
+
+        # 페이지 이동 버튼 추가
+        if self.max_page > 0:
+            if self.page > 0:
+                self.add_item(PageButton("◀ 이전", self, self.page - 1))
+            if self.page < self.max_page:
+                self.add_item(PageButton("다음 ▶", self, self.page + 1))
+
+class PageButton(discord.ui.Button):
+    def __init__(self, label, view, target_page):
+        super().__init__(label=label, style=discord.ButtonStyle.blurple)
+        self.view_ref = view
+        self.target_page = target_page
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view_ref.page = self.target_page
+        self.view_ref.update_buttons()
+        await interaction.response.edit_message(
+            content="📌 출석 패널 (페이지 {}/{})".format(
+                self.view_ref.page + 1, self.view_ref.max_page + 1
+            ),
+            view=self.view_ref
+        )
 
 # =========================
 # 🔥 명령어
@@ -179,8 +217,8 @@ async def 출석(ctx):
     if not members:
         await ctx.send("등록된 인원 없음")
         return
-    view = AttendanceView(members)
-    await ctx.send("📌 출석 패널", view=view)
+    view = PaginatedAttendanceView(members)
+    await ctx.send(f"📌 출석 패널 (페이지 1/{max((len(members)-1)//20 +1,1)})", view=view)
 
 @bot.command()
 async def 추가(ctx, *, names: str):
