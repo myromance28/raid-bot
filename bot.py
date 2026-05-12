@@ -168,7 +168,7 @@ class PaginatedAttendanceView(discord.ui.View):
         super().__init__(timeout=None)
         self.members = members
         self.page = page
-        self.per_page = 20  # 페이지당 최대 20명
+        self.per_page = 10  # 페이지당 최대 10명
         self.max_page = (len(members) - 1) // self.per_page
         self.update_buttons()
 
