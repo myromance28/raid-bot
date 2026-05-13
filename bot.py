@@ -18,7 +18,6 @@ conn = sqlite3.connect("data.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
 
-# 테이블 생성
 cursor.execute("CREATE TABLE IF NOT EXISTS attendance (date TEXT, time_slot TEXT, name TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS members (name TEXT PRIMARY KEY, total INTEGER DEFAULT 0)")
 cursor.execute("CREATE TABLE IF NOT EXISTS drops (item_name TEXT, winner TEXT, date TEXT, boss_name TEXT)")
@@ -74,7 +73,7 @@ def get_next_boss_time():
         if t > now: return t
 
 # =========================
-# 🔹 UI 컴포넌트 (모달 및 버튼)
+# 🔹 UI 컴포넌트
 # =========================
 class DropModal(discord.ui.Modal, title="💎 보스 득템 기록"):
     item_input = discord.ui.TextInput(label="아이템 이름", placeholder="예: 영웅 비기")
@@ -156,12 +155,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.command()
 async def 출석(ctx):
-    name = ctx.author.display_name
-    date = datetime.now(KST).strftime("%Y-%m-%d")
-    slot = get_slot()
-    result = attend(name, date, slot)
-    if result == "already": await ctx.send(f"⚠️ {name}님, 이미 {slot}시 타임에 출석하셨습니다.")
-    else: await ctx.send(f"✅ {name}님, {date} [{slot}:00] 출석 완료!")
+    # !출석 입력 시 즉시 패널 생성
+    with db_lock:
+        cursor.execute("SELECT name FROM members ORDER BY name ASC"); m_list = [r[0] for r in cursor.fetchall()]
+        cursor.execute("SELECT boss_name FROM boss_list ORDER BY boss_name ASC"); b_list = [r[0] for r in cursor.fetchall()]
+    
+    if not m_list:
+        await ctx.send("❌ 등록된 인원이 없습니다. `!추가`로 인원을 먼저 등록해 주세요."); return
+        
+    now = datetime.now(KST)
+    t_date = now.strftime("%Y-%m-%d")
+    t_slot = get_slot()
+    
+    await ctx.send(f"⚔️ **{t_date} [{t_slot}:00] 보스타임 패널**", 
+                   view=ToggleAttendanceView(m_list, t_date, t_slot, b_list))
 
 @bot.command()
 async def 점수수정(ctx, name: str, amount: int):
@@ -176,7 +183,7 @@ async def 초기화(ctx):
         cursor.execute("DELETE FROM attendance")
         cursor.execute("UPDATE members SET total = 0")
         conn.commit()
-    await ctx.send("♻️ 모든 출석 기록과 누적 점수가 초기화되었습니다.")
+    await ctx.send("♻️ 모든 출석 기록과 누적 점수가 초기화되었습니다. (명단은 유지됩니다)")
 
 @bot.command()
 async def 추가(ctx, *, names: str):
@@ -186,8 +193,10 @@ async def 추가(ctx, *, names: str):
 
 @bot.command()
 async def 삭제(ctx, name: str):
-    with db_lock: cursor.execute("DELETE FROM members WHERE name=?", (name,)); conn.commit()
-    await ctx.send(f"✅ {name} 삭제 완료")
+    with db_lock:
+        cursor.execute("DELETE FROM members WHERE name=?", (name,))
+        conn.commit()
+    await ctx.send(f"✅ **{name}**님이 명단에서 삭제되었습니다. 다음 패널부터 나타나지 않습니다.")
 
 @bot.command()
 async def 명단(ctx):
