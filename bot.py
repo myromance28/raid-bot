@@ -33,7 +33,7 @@ def run(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 def keep_alive(): Thread(target=run).start()
 
 # =========================
-# 🔹 핵심 함수
+# 🔹 핵심 함수 (개선됨)
 # =========================
 def get_slot():
     hour = datetime.now(KST).hour
@@ -43,9 +43,11 @@ def get_slot():
     else: return "21"
 
 def is_attended(name, date, slot):
+    """락을 걸고 빠르게 결과만 가져온 뒤 즉시 락을 해제합니다."""
     with db_lock:
         cursor.execute("SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?", (date, slot, name))
-        return cursor.fetchone() is not None
+        res = cursor.fetchone()
+    return res is not None
 
 # =========================
 # 🔹 UI 컴포넌트
@@ -85,21 +87,27 @@ class ToggleAttendButton(discord.ui.Button):
     def __init__(self, name, target_date, target_slot):
         self.member_name, self.target_date, self.target_slot = name, target_date, target_slot
         done = is_attended(name, target_date, target_slot)
-        # 초기 상태 설정: 출석했으면 회색(secondary), 안했으면 녹색(green)
         super().__init__(label=name, style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.green)
         
     async def callback(self, interaction: discord.Interaction):
+        # 🚀 [개선] DB 작업을 먼저 수행하고 Lock을 즉시 해제
         with db_lock:
-            if is_attended(self.member_name, self.target_date, self.target_slot):
-                cursor.execute("DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?", (self.target_date, self.target_slot, self.member_name))
+            cursor.execute("SELECT 1 FROM attendance WHERE date=? AND time_slot=? AND name=?", 
+                           (self.target_date, self.target_slot, self.member_name))
+            already_done = cursor.fetchone() is not None
+            
+            if already_done:
+                cursor.execute("DELETE FROM attendance WHERE date=? AND time_slot=? AND name=?", 
+                               (self.target_date, self.target_slot, self.member_name))
                 cursor.execute("UPDATE members SET total = CASE WHEN total > 0 THEN total - 1 ELSE 0 END WHERE name=?", (self.member_name,))
-                self.style = discord.ButtonStyle.green # 취소 시 다시 녹색
+                self.style = discord.ButtonStyle.green
             else:
                 cursor.execute("INSERT INTO attendance VALUES (?, ?, ?)", (self.target_date, self.target_slot, self.member_name))
                 cursor.execute("INSERT INTO members(name, total) VALUES(?, 1) ON CONFLICT(name) DO UPDATE SET total = total + 1", (self.member_name,))
-                self.style = discord.ButtonStyle.secondary # 출석 시 회색
+                self.style = discord.ButtonStyle.secondary
             conn.commit()
-        # 🚀 상호작용 실패 방지: defer 대신 edit_message를 사용하여 즉시 갱신
+            
+        # 🚀 [개선] Lock 밖에서 UI 업데이트를 수행하여 데드락 방지
         await interaction.response.edit_message(view=self.view)
 
 class ToggleAttendanceView(discord.ui.View):
@@ -132,6 +140,7 @@ class ToggleAttendanceView(discord.ui.View):
         if self.bosses:
             self.add_item(BossActionSelect(self.bosses, self))
 
+        # 🚀 [고정] 결과 전송 빨간 버튼
         send_btn = discord.ui.Button(label="📊 결과 전송 (정산)", style=discord.ButtonStyle.danger, row=3)
         async def send_cb(i):
             await i.response.defer(ephemeral=True)
@@ -147,7 +156,9 @@ class ToggleAttendanceView(discord.ui.View):
             await i.followup.send("🚀 전송 완료!", ephemeral=True)
         send_btn.callback = send_cb; self.add_item(send_btn)
 
-# (명령어 파트는 기존과 동일하므로 하단 코드는 생략하지 말고 그대로 사용하세요)
+# =========================
+# 🔹 명령어 및 이벤트
+# =========================
 intents = discord.Intents.default(); intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -181,10 +192,49 @@ async def 보스삭제(ctx, name: str):
     with db_lock: cursor.execute("DELETE FROM boss_list WHERE boss_name=?", (name,)); conn.commit()
     await ctx.send(f"🗑️ 보스 [{name}] 삭제")
 
-# (나머지 조회, 주간, 명단 등도 위와 같은 패턴으로 유지)
+@bot.command()
+async def 명단(ctx):
+    with db_lock: cursor.execute("SELECT name FROM members ORDER BY name ASC"); members = [r[0] for r in cursor.fetchall()]
+    await ctx.send("📋 **명단**\n" + "\n".join(members) if members else "없음")
+
+@bot.command()
+async def 조회(ctx, start: str, end: str):
+    with db_lock: cursor.execute("SELECT name, COUNT(*) FROM attendance WHERE date BETWEEN ? AND ? GROUP BY name ORDER BY COUNT(*) DESC", (start, end)); rows = cursor.fetchall()
+    if not rows: return await ctx.send("데이터 없음")
+    await ctx.send(f"📊 점수 ({start}~{end})\n" + "\n".join([f"{i+1}. {r[0]} - {r[1]}점" for i, r in enumerate(rows)]))
+
+@bot.command()
+async def 주간(ctx):
+    now = datetime.now(KST); mon = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d"); sun = (now - timedelta(days=now.weekday()) + timedelta(days=6)).strftime("%Y-%m-%d")
+    await 조회(ctx, mon, sun)
+
+@bot.command()
+async def 초기화(ctx):
+    with db_lock: cursor.execute("DELETE FROM attendance"); cursor.execute("UPDATE members SET total = 0"); conn.commit()
+    await ctx.send("♻️ 초기화 완료.")
+
+@bot.command()
+async def 득템현황(ctx):
+    with db_lock: cursor.execute("SELECT boss_name, winner, item_name, date FROM drops ORDER BY date DESC LIMIT 15"); rows = cursor.fetchall()
+    if not rows: return await ctx.send("기록 없음")
+    await ctx.send("💎 **최근 득템 현황**\n" + "\n".join([f"• [{d}] {b}: {w}({i})" for b, w, i, d in rows]))
+
+@tasks.loop(minutes=1)
+async def auto_boss_panel():
+    now = datetime.now(KST)
+    if now.minute == 50 and now.hour in [2, 8, 14, 20]:
+        channel = bot.get_channel(BOSS_CHANNEL_ID)
+        if not channel: return
+        with db_lock:
+            cursor.execute("SELECT name FROM members ORDER BY name ASC"); m_list = [r[0] for r in cursor.fetchall()]
+            cursor.execute("SELECT boss_name FROM boss_list ORDER BY boss_name ASC"); b_list = [r[0] for r in cursor.fetchall()]
+        if not m_list: return
+        t_date, t_slot = now.strftime("%Y-%m-%d"), f"{(now.hour+1)%24:02d}"
+        await channel.send(f"⚔️ **{t_date} [{t_slot}:00] 보스타임 패널**", view=ToggleAttendanceView(m_list, t_date, t_slot, b_list))
 
 @bot.event
 async def on_ready():
+    if not auto_boss_panel.is_running(): auto_boss_panel.start()
     print(f"로그인 완료: {bot.user}")
 
 keep_alive()
