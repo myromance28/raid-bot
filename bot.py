@@ -8,11 +8,22 @@ from threading import Thread
 import threading
 
 # =========================
-# 🔹 KST 및 기본 설정
+# 🔹 설정 및 초기화 (KST)
 # =========================
 KST = timezone(timedelta(hours=9))
 BOSS_CHANNEL_ID = 1503420212794622073 
 BOSS_TIMES = [3, 9, 15, 21]
+
+conn = sqlite3.connect("data.db", check_same_thread=False)
+cursor = conn.cursor()
+db_lock = threading.Lock()
+
+# 테이블 생성
+cursor.execute("CREATE TABLE IF NOT EXISTS attendance (date TEXT, time_slot TEXT, name TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS members (name TEXT PRIMARY KEY, total INTEGER DEFAULT 0)")
+cursor.execute("CREATE TABLE IF NOT EXISTS drops (item_name TEXT, winner TEXT, date TEXT, boss_name TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS boss_list (boss_name TEXT PRIMARY KEY)")
+conn.commit()
 
 # =========================
 # 🔹 Flask (유지용)
@@ -22,19 +33,6 @@ app = Flask(__name__)
 def home(): return "OK"
 def run(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 def keep_alive(): Thread(target=run).start()
-
-# =========================
-# 🔹 DB 설정 및 테이블 생성
-# =========================
-conn = sqlite3.connect("data.db", check_same_thread=False)
-cursor = conn.cursor()
-db_lock = threading.Lock()
-
-cursor.execute("CREATE TABLE IF NOT EXISTS attendance (date TEXT, time_slot TEXT, name TEXT)")
-cursor.execute("CREATE TABLE IF NOT EXISTS members (name TEXT PRIMARY KEY, total INTEGER DEFAULT 0)")
-cursor.execute("CREATE TABLE IF NOT EXISTS drops (item_name TEXT, winner TEXT, date TEXT, boss_name TEXT)")
-cursor.execute("CREATE TABLE IF NOT EXISTS boss_list (boss_name TEXT PRIMARY KEY)")
-conn.commit()
 
 # =========================
 # 🔹 핵심 로직 함수
@@ -119,12 +117,10 @@ class ToggleAttendanceView(discord.ui.View):
 
     def build_page(self):
         self.clear_items()
-        # 출석 버튼
         start = self.current_page * 20
         for name in self.members[start:start+20]:
             self.add_item(ToggleAttendButton(name, self.target_date, self.target_slot))
         
-        # 페이지 버튼 (row 4)
         if self.total_pages > 1:
             prev_btn = discord.ui.Button(label="◀ 이전", style=discord.ButtonStyle.gray, row=4)
             async def prev_cb(interaction):
@@ -138,7 +134,6 @@ class ToggleAttendanceView(discord.ui.View):
                 self.build_page(); await interaction.response.edit_message(view=self)
             next_btn.callback = next_cb; self.add_item(next_btn)
 
-        # 보스 섹션 (row 5)
         self.add_item(discord.ui.Button(label="🔥 보스 득템 현황 🔥", style=discord.ButtonStyle.gray, disabled=True, row=5))
         current_row = 6
         for boss in self.bosses:
@@ -156,9 +151,32 @@ class ToggleAttendanceView(discord.ui.View):
 # 🔹 봇 설정 및 명령어
 # =========================
 intents = discord.Intents.default()
-intents.message_content = True  # 첫 번째 코드와 동일 설정
-
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.command()
+async def 출석(ctx):
+    name = ctx.author.display_name
+    date = datetime.now(KST).strftime("%Y-%m-%d")
+    slot = get_slot()
+    result = attend(name, date, slot)
+    if result == "already": await ctx.send(f"⚠️ {name}님, 이미 {slot}시 타임에 출석하셨습니다.")
+    else: await ctx.send(f"✅ {name}님, {date} [{slot}:00] 출석 완료!")
+
+@bot.command()
+async def 점수수정(ctx, name: str, amount: int):
+    with db_lock:
+        cursor.execute("UPDATE members SET total = total + ? WHERE name = ?", (amount, name))
+        conn.commit()
+    await ctx.send(f"📊 **{name}**님의 누적 점수가 {amount}만큼 수정되었습니다.")
+
+@bot.command()
+async def 초기화(ctx):
+    with db_lock:
+        cursor.execute("DELETE FROM attendance")
+        cursor.execute("UPDATE members SET total = 0")
+        conn.commit()
+    await ctx.send("♻️ 모든 출석 기록과 누적 점수가 초기화되었습니다.")
 
 @bot.command()
 async def 추가(ctx, *, names: str):
@@ -233,8 +251,5 @@ async def on_ready():
     if not auto_boss_panel.is_running(): auto_boss_panel.start()
     print(f"로그인 완료 : {bot.user}")
 
-# =========================
-# 🔹 실행
-# =========================
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
