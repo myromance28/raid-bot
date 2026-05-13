@@ -34,14 +34,14 @@ def run(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 def keep_alive(): Thread(target=run).start()
 
 # =========================
-# 🔹 핵심 로직 함수
+# 🔹 핵심 로직 함수 (수정됨)
 # =========================
 def get_slot():
     now = datetime.now(KST)
-    val = now.hour * 100 + now.minute
-    if 250 <= val < 850: return "03"
-    elif 850 <= val < 1450: return "09"
-    elif 1450 <= val < 2050: return "15"
+    hour = now.hour
+    if 0 <= hour < 6: return "03"
+    elif 6 <= hour < 12: return "09"
+    elif 12 <= hour < 18: return "15"
     else: return "21"
 
 def attend(name, date, slot):
@@ -155,7 +155,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.command()
 async def 출석(ctx):
-    # !출석 입력 시 즉시 패널 생성
     with db_lock:
         cursor.execute("SELECT name FROM members ORDER BY name ASC"); m_list = [r[0] for r in cursor.fetchall()]
         cursor.execute("SELECT boss_name FROM boss_list ORDER BY boss_name ASC"); b_list = [r[0] for r in cursor.fetchall()]
