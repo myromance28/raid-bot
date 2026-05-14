@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands, tasks
-from discord.ext.commands import has_permissions
 import os
 import psycopg2
 from psycopg2 import pool
@@ -9,32 +8,37 @@ from flask import Flask
 from threading import Thread
 
 # =========================
-# 🔹 설정 및 시간대
+# 🔹 설정 및 관리자 명단
 # =========================
 KST = timezone(timedelta(hours=9))
 BOSS_CHANNEL_ID = 1503420212794622073
 LOG_CHANNEL_ID = 1495580902787514508
 
+# 요청하신 관리자 ID 5명 업데이트
+BOT_ADMIN_IDS = [
+    1295279721050935306, 
+    1469924619170349169, 
+    1330608030844321884, 
+    1476159593330511954, 
+    344403970426535937
+]
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 # =========================
-# 🔹 PostgreSQL 연결 풀
+# 🔹 PostgreSQL 연결 및 초기화
 # =========================
 try:
     if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
 except Exception as e:
-    print(f"❌ DB 연결 실패: {e}")
-    exit()
+    print(f"❌ DB 연결 실패: {e}"); exit()
 
 def get_db_connection(): return db_pool.getconn()
 def release_db_connection(conn): db_pool.putconn(conn)
 
-# =========================
-# 🔹 DB 초기화
-# =========================
 def init_db():
     conn = get_db_connection()
     try:
@@ -49,22 +53,24 @@ def init_db():
 init_db()
 
 # =========================
-# 🔹 Flask (24시간 유지)
+# 🔹 권한 체크 데코레이터
 # =========================
-app = Flask(__name__)
-@app.route("/")
-def home(): return "Bot is Alive"
-def run(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-def keep_alive(): Thread(target=run).start()
+def is_bot_admin():
+    async def predicate(ctx):
+        if ctx.author.id in BOT_ADMIN_IDS:
+            return True
+        await ctx.send("❌ 이 명령어를 사용할 권한이 없습니다. (관리자 전용)")
+        return False
+    return commands.check(predicate)
 
 # =========================
 # 🔹 헬퍼 함수
 # =========================
 def get_slot():
-    hour = datetime.now(KST).hour
-    if 0 <= hour < 6: return "03"
-    elif 6 <= hour < 12: return "09"
-    elif 12 <= hour < 18: return "15"
+    h = datetime.now(KST).hour
+    if 0 <= h < 6: return "03"
+    elif 6 <= h < 12: return "09"
+    elif 12 <= h < 18: return "15"
     else: return "21"
 
 def is_attended(name, date, slot):
@@ -112,7 +118,7 @@ class BossActionSelect(discord.ui.Select):
     def __init__(self, bosses, parent_view):
         self.parent_view = parent_view
         options = [discord.SelectOption(label=f"{b} 컷", emoji="⚔️", value=b) for b in bosses[:25]]
-        super().__init__(placeholder="보스 컷 처리...", options=options, row=3) # row 3으로 배치
+        super().__init__(placeholder="보스 컷 처리...", options=options, row=3)
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(f"[{self.values[0]}] 결과 선택", view=DropChoiceView(self.values[0], self.parent_view), ephemeral=True)
 
@@ -138,63 +144,35 @@ class ToggleAttendButton(discord.ui.Button):
             await interaction.response.edit_message(view=self.view)
         finally: release_db_connection(conn)
 
-# =========================
-# 🔹 [핵심] 페이지네이션 출석 뷰
-# =========================
 class ToggleAttendanceView(discord.ui.View):
     def __init__(self, members, target_date, target_slot, bosses):
         super().__init__(timeout=None)
-        self.members = members
-        self.target_date = target_date
-        self.target_slot = target_slot
-        self.bosses = bosses
-        self.current_page = 0
-        self.boss_status = {b: "미확인" for b in bosses}
+        self.members, self.target_date, self.target_slot, self.bosses = members, target_date, target_slot, bosses
+        self.current_page, self.boss_status = 0, {b: "미확인" for b in bosses}
         self.total_pages = (len(members) - 1) // 15 + 1
         self.create_buttons()
 
     def create_buttons(self):
         self.clear_items()
-        
-        # 1. 인원 버튼 (최대 15명, row 0, 1, 2 사용)
-        start = self.current_page * 15
-        end = start + 15
+        start, end = self.current_page * 15, (self.current_page + 1) * 15
         for name in self.members[start:end]:
             self.add_item(ToggleAttendButton(name, self.target_date, self.target_slot))
+        if self.bosses: self.add_item(BossActionSelect(self.bosses, self))
         
-        # 2. 보스 선택 메뉴 (row 3)
-        if self.bosses:
-            self.add_item(BossActionSelect(self.bosses, self))
-
-        # 3. 맨 하단 컨트롤 바 (row 4)
-        # 이전 페이지 버튼
         btn_prev = discord.ui.Button(label="◀ 이전", style=discord.ButtonStyle.gray, row=4, disabled=(self.current_page == 0))
         btn_prev.callback = self.prev_page
         self.add_item(btn_prev)
-
-        # 페이지 표시 버튼
-        btn_info = discord.ui.Button(label=f"{self.current_page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, row=4, disabled=True)
-        self.add_item(btn_info)
-
-        # 다음 페이지 버튼
+        self.add_item(discord.ui.Button(label=f"{self.current_page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, row=4, disabled=True))
         btn_next = discord.ui.Button(label="다음 ▶", style=discord.ButtonStyle.gray, row=4, disabled=(self.current_page == self.total_pages - 1))
         btn_next.callback = self.next_page
         self.add_item(btn_next)
-
-        # 정산 버튼 (row 4의 마지막)
+        
         btn_send = discord.ui.Button(label="📊 정산", style=discord.ButtonStyle.danger, row=4)
         btn_send.callback = self.send_result
         self.add_item(btn_send)
 
-    async def prev_page(self, interaction: discord.Interaction):
-        self.current_page -= 1
-        self.create_buttons()
-        await interaction.response.edit_message(view=self)
-
-    async def next_page(self, interaction: discord.Interaction):
-        self.current_page += 1
-        self.create_buttons()
-        await interaction.response.edit_message(view=self)
+    async def prev_page(self, i): self.current_page -= 1; self.create_buttons(); await i.response.edit_message(view=self)
+    async def next_page(self, i): self.current_page += 1; self.create_buttons(); await i.response.edit_message(view=self)
 
     async def send_result(self, i):
         log_ch = i.client.get_channel(LOG_CHANNEL_ID)
@@ -223,7 +201,9 @@ async def on_ready():
     if not auto_boss_panel.is_running(): auto_boss_panel.start()
     print(f"✅ 로그인 완료: {bot.user}")
 
+# --- 관리자 전용 명령어 ---
 @bot.command()
+@is_bot_admin()
 async def 출석(ctx):
     conn = get_db_connection()
     try:
@@ -234,12 +214,11 @@ async def 출석(ctx):
             b_list = [r[0] for r in cursor.fetchall()]
         if not m_list: return await ctx.send("❌ 등록된 인원이 없습니다.")
         now = datetime.now(KST)
-        await ctx.send(f"⚔️ {now.strftime('%Y-%m-%d')} [{get_slot()}:00] 패널", 
-                       view=ToggleAttendanceView(m_list, now.strftime('%Y-%m-%d'), get_slot(), b_list))
+        await ctx.send(f"⚔️ {now.strftime('%Y-%m-%d')} [{get_slot()}:00] 패널", view=ToggleAttendanceView(m_list, now.strftime('%Y-%m-%d'), get_slot(), b_list))
     finally: release_db_connection(conn)
 
 @bot.command()
-@has_permissions(administrator=True)
+@is_bot_admin()
 async def 추가(ctx, *, names: str):
     conn = get_db_connection()
     try:
@@ -251,7 +230,18 @@ async def 추가(ctx, *, names: str):
     finally: release_db_connection(conn)
 
 @bot.command()
-@has_permissions(administrator=True)
+@is_bot_admin()
+async def 삭제(ctx, name: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM members WHERE name=%s", (name,))
+            conn.commit()
+        await ctx.send(f"✅ {name} 삭제 완료")
+    finally: release_db_connection(conn)
+
+@bot.command()
+@is_bot_admin()
 async def 보스추가(ctx, name: str):
     conn = get_db_connection()
     try:
@@ -262,6 +252,30 @@ async def 보스추가(ctx, name: str):
     finally: release_db_connection(conn)
 
 @bot.command()
+@is_bot_admin()
+async def 보스삭제(ctx, name: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM boss_list WHERE boss_name=%s", (name,))
+            conn.commit()
+        await ctx.send(f"📌 보스 [{name}] 삭제 완료")
+    finally: release_db_connection(conn)
+
+@bot.command()
+@is_bot_admin()
+async def 출석초기화(ctx):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM attendance")
+            cursor.execute("UPDATE members SET total = 0")
+            conn.commit()
+        await ctx.send("🚨 모든 출석 기록과 점수가 초기화되었습니다.")
+    finally: release_db_connection(conn)
+
+# --- 일반 유저 사용 가능 ---
+@bot.command()
 async def 조회(ctx, 시작일: str, 종료일: str):
     conn = get_db_connection()
     try:
@@ -269,8 +283,28 @@ async def 조회(ctx, 시작일: str, 종료일: str):
             cursor.execute("SELECT name, COUNT(*) FROM attendance WHERE date BETWEEN %s AND %s GROUP BY name ORDER BY COUNT(*) DESC", (시작일, 종료일))
             rows = cursor.fetchall()
         text = "\n".join([f"{n}: {c}회" for n, c in rows]) if rows else "기록 없음"
-        await ctx.send(f"📊 통계 ({시작일} ~ {종료일})\n\n{text}")
+        await ctx.send(f"📊 출석 통계 ({시작일} ~ {종료일})\n\n{text}")
     finally: release_db_connection(conn)
+
+@bot.command()
+async def 득템현황(ctx):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT date, boss_name, winner, item_name FROM drops ORDER BY id DESC LIMIT 10")
+            rows = cursor.fetchall()
+        text = "\n".join([f"• [{r[0]}] {r[1]} : {r[2]} ({r[3]})" for r in rows]) if rows else "기록 없음"
+        await ctx.send("💎 최근 득템 현황\n" + text)
+    finally: release_db_connection(conn)
+
+# =========================
+# 🔹 Flask & 자동 패널
+# =========================
+app = Flask(__name__)
+@app.route("/")
+def home(): return "Bot is Alive"
+def run(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+def keep_alive(): Thread(target=run).start()
 
 @tasks.loop(minutes=1)
 async def auto_boss_panel():
