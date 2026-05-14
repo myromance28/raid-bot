@@ -167,13 +167,110 @@ async def send_log(message):
         await channel.send(message)
 
 # =========================
-# 🔹 출석 등록 (관리자 전용)
-# 사용:
-# !출석 닉네임
+# 🔹 출석 패널 View
+# =========================
+class AttendanceView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="출석하기",
+        style=discord.ButtonStyle.success,
+        emoji="✅"
+    )
+    async def attendance_btn(self, interaction, button):
+
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        now_time = datetime.now(KST).strftime("%H:%M")
+
+        user_name = interaction.user.display_name
+
+        conn = get_db_connection()
+
+        try:
+            with conn.cursor() as cursor:
+
+                cursor.execute("""
+                SELECT *
+                FROM attendance
+                WHERE date=%s
+                AND name=%s
+                """, (
+                    today,
+                    user_name
+                ))
+
+                exists = cursor.fetchone()
+
+                if exists:
+
+                    return await interaction.response.send_message(
+                        "⚠️ 이미 출석 완료했습니다.",
+                        ephemeral=True
+                    )
+
+                cursor.execute("""
+                INSERT INTO attendance (
+                    date,
+                    time_slot,
+                    name
+                )
+                VALUES (%s, %s, %s)
+                """, (
+                    today,
+                    now_time,
+                    user_name
+                ))
+
+                cursor.execute("""
+                INSERT INTO members (
+                    name,
+                    total
+                )
+                VALUES (%s, 1)
+                ON CONFLICT (name)
+                DO UPDATE SET total = members.total + 1
+                """, (user_name,))
+
+                conn.commit()
+
+            await interaction.response.send_message(
+                f"✅ {user_name} 출석 완료!",
+                ephemeral=True
+            )
+
+            await send_log(
+                f"📌 출석 | {user_name}"
+            )
+
+        finally:
+            release_db_connection(conn)
+
+# =========================
+# 🔹 출석 패널 생성 (관리자 전용)
 # =========================
 @bot.command()
 @is_bot_admin()
-async def 출석(ctx, 이름: str):
+async def 출석(ctx):
+
+    embed = discord.Embed(
+        title="📅 출석 체크",
+        description="아래 버튼을 눌러 출석하세요.",
+        color=discord.Color.green()
+    )
+
+    await ctx.send(
+        embed=embed,
+        view=AttendanceView()
+    )
+
+# =========================
+# 🔹 관리자 강제 출석
+# =========================
+@bot.command()
+@is_bot_admin()
+async def 출석등록(ctx, 이름: str):
 
     today = datetime.now(KST).strftime("%Y-%m-%d")
     now_time = datetime.now(KST).strftime("%H:%M")
@@ -226,11 +323,7 @@ async def 출석(ctx, 이름: str):
             conn.commit()
 
         await ctx.send(
-            f"✅ {이름} 출석 완료"
-        )
-
-        await send_log(
-            f"📌 출석 등록 | {이름}"
+            f"✅ {이름} 강제 출석 완료"
         )
 
     finally:
@@ -306,8 +399,6 @@ async def 출석순위(ctx):
 
 # =========================
 # 🔹 출석 점수 수정
-# 사용:
-# !출석수정 이름 점수
 # =========================
 @bot.command()
 @is_bot_admin()
@@ -339,17 +430,11 @@ async def 출석수정(ctx, 이름: str, 점수: int):
             f"{점수}점으로 변경되었습니다."
         )
 
-        await send_log(
-            f"🛠️ 출석수정 | {이름} → {점수}"
-        )
-
     finally:
         release_db_connection(conn)
 
 # =========================
 # 🔹 기간 조회
-# 사용:
-# !기간조회 2026-05-01 2026-05-15
 # =========================
 @bot.command()
 async def 기간조회(ctx, 시작일: str, 종료일: str):
@@ -841,19 +926,10 @@ class DropModal(discord.ui.Modal, title="💎 득템 기록"):
 
                 conn.commit()
 
-            self.view_ref.boss_status[
-                self.boss_name
-            ] = f"✅ 컷 ({winner})"
-
             await interaction.response.send_message(
                 f"✅ [{self.boss_name}] "
                 f"{winner}님 {item} 획득!",
                 ephemeral=False
-            )
-
-            await send_log(
-                f"💎 [{self.boss_name}] "
-                f"{winner} - {item}"
             )
 
         finally:
@@ -868,13 +944,9 @@ class BossView(discord.ui.View):
 
         super().__init__(timeout=None)
 
-        self.boss_status = {}
-
         bosses = load_bosses()
 
         for boss in bosses:
-
-            self.boss_status[boss] = "대기"
 
             btn = discord.ui.Button(
                 label=boss,
@@ -935,7 +1007,8 @@ async def 도움말(ctx):
 
 👑 관리자 명령어
 
-!출석 이름
+!출석
+!출석등록 이름
 !출석수정 이름 점수
 !보스추가 보스명
 !보스삭제 보스명
