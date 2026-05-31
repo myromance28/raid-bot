@@ -1199,28 +1199,11 @@ async def weekly_score(ctx):
 # 🔹 기간 조회
 # =====================================================
 @bot.command(name="기간조회")
-async def range_score(ctx, date_range: str):
-
-    try:
-
-        start_date, end_date = date_range.split("~")
-
-        start_date = (
-            f"{start_date[:4]}-"
-            f"{start_date[4:6]}-"
-            f"{start_date[6:8]}"
-        )
-
-        end_date = (
-            f"{end_date[:4]}-"
-            f"{end_date[4:6]}-"
-            f"{end_date[6:8]}"
-        )
-
-    except:
-        return await ctx.send(
-            "사용법: !기간조회 20260501~20260605"
-        )
+async def range_score(
+    ctx,
+    start_date: str,
+    end_date: str
+):
 
     conn = get_db_connection()
 
