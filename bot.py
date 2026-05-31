@@ -1427,6 +1427,45 @@ async def auto_boss_panel():
             release_db_connection(conn)
 
 # =====================================================
+# 🔹 출석 채널 자동 정리
+# =====================================================
+@tasks.loop(minutes=1)
+async def clear_old_panels():
+
+    now = datetime.now(KST)
+
+    if (
+        (now.hour == 6 and now.minute == 0)
+        or
+        (now.hour == 12 and now.minute == 0)
+        or
+        (now.hour == 18 and now.minute == 0)
+        or
+        (now.hour == 0 and now.minute == 0)
+    ):
+
+        channel = bot.get_channel(
+            BOSS_CHANNEL_ID
+        )
+
+        if not channel:
+            return
+
+        try:
+
+            deleted = await channel.purge(limit=200)
+
+            print(
+                f"[채널정리] {len(deleted)}개 삭제"
+            )
+
+        except Exception as e:
+
+            print(
+                f"[채널정리 오류] {e}"
+            )
+
+# =====================================================
 # 🔹 이벤트
 # =====================================================
 @bot.event
@@ -1437,6 +1476,9 @@ async def on_ready():
 
     if not flush_attendance_cache.is_running():
         flush_attendance_cache.start()
+
+    if not clear_old_panels.is_running():
+        clear_old_panels.start()
 
     print(f"로그인 완료: {bot.user}")
 
