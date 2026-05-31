@@ -18,7 +18,7 @@ import asyncio
 # =====================================================
 KST = timezone(timedelta(hours=9))
 
-BOSS_CHANNEL_ID = 1503420212794622073
+BOSS_CHANNEL_ID = 1510737312189911280
 LOG_CHANNEL_ID = 1495580902787514508
 
 ADMIN_IDS = {
