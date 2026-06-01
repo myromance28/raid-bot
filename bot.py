@@ -1121,7 +1121,7 @@ async def all_drops(ctx):
                        boss_name, date
                 FROM drops
                 ORDER BY id DESC
-                LIMIT 50
+                LIMIT 100
             """)
 
             rows = cursor.fetchall()
@@ -1347,7 +1347,7 @@ async def 최근득템삭제(ctx, 개수: int):
                 WHERE id IN (
                     SELECT id
                     FROM drops
-                    ORDER BY id DESC
+                    ORDER BY id ASC
                     LIMIT %s
                 )
             """, (개수,))
@@ -1356,40 +1356,6 @@ async def 최근득템삭제(ctx, 개수: int):
 
         await ctx.send(
             f"🗑️ 최근 득템 {개수}개 삭제 완료"
-        )
-
-    finally:
-        release_db_connection(conn)
-
-# =====================================================
-# 🔹 점수 수정
-# =====================================================
-@bot.command()
-@commands.check(is_admin)
-async def 점수수정(
-    ctx,
-    name: str,
-    score: int
-):
-
-    conn = get_db_connection()
-
-    try:
-        with conn.cursor() as cursor:
-
-            cursor.execute("""
-                UPDATE members
-                SET total=%s
-                WHERE name=%s
-            """, (
-                score,
-                name
-            ))
-
-            conn.commit()
-
-        await ctx.send(
-            f"✅ {name} 점수 수정 완료"
         )
 
     finally:
@@ -1514,7 +1480,7 @@ async def clear_old_panels():
 
         try:
 
-            deleted = await channel.purge(limit=200)
+            deleted = await channel.purge(limit=500)
 
             print(
                 f"[채널정리] {len(deleted)}개 삭제"
