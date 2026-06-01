@@ -33,8 +33,13 @@ ADMIN_IDS = {
 # =====================================================
 # 🔹 관리자 체크
 # =====================================================
+ADMIN_CHANNEL_ID = 1510737312189911280
+
 def is_admin(ctx):
-    return ctx.author.id in ADMIN_IDS
+    return (
+        ctx.author.id in ADMIN_IDS
+        and ctx.channel.id == ADMIN_CHANNEL_ID
+    )
 
 # =====================================================
 # 🔹 PostgreSQL
@@ -1480,6 +1485,16 @@ async def on_ready():
         clear_old_panels.start()
 
     print(f"로그인 완료: {bot.user}")
+
+@bot.event
+async def on_command_error(ctx, error):
+
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send(
+            "❌ 이 명령어는 관리자 전용 채널에서만 사용할 수 있습니다."
+        )
+        return
+
 
 # =====================================================
 # 🔹 실행
