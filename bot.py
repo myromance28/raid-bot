@@ -764,7 +764,7 @@ class ToggleAttendanceView(discord.ui.View):
 # =====================================================
 # 🔹 캐시 → DB 저장
 # =====================================================
-@tasks.loop(seconds=10)
+@tasks.loop(seconds=5)
 async def flush_attendance_cache():
 
     global attendance_add_cache
