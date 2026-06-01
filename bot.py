@@ -1343,7 +1343,10 @@ async def auto_boss_panel():
 
     now = datetime.now(KST)
 
-    if True:
+    if  (
+    now.hour == 16
+    and now.minute >= 22
+):
 
         t_date = now.strftime("%Y-%m-%d")
         t_slot = f"{(now.hour + 1) % 24:02d}"
