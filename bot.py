@@ -1344,8 +1344,8 @@ async def auto_boss_panel():
     now = datetime.now(KST)
 
     if  (
-    now.hour == 16
-    and now.minute >= 22
+    now.hour in [2, 8, 14, 20]
+    and 50 <= now.minute <= 51
 ):
 
         t_date = now.strftime("%Y-%m-%d")
