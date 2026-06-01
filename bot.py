@@ -7,7 +7,6 @@ import discord
 from discord.ext import commands, tasks
 import os
 import psycopg2
-from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 from threading import Thread
@@ -45,17 +44,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL 환경변수 없음")
 
-db_pool = psycopg2.pool.ThreadedConnectionPool(
-    1,
-    20,
-    DATABASE_URL
-)
-
 def get_db_connection():
-    return db_pool.getconn()
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
+    )
 
 def release_db_connection(conn):
-    db_pool.putconn(conn)
+    try:
+        conn.close()
+    except:
+        pass
 
 # =====================================================
 # 🔹 메모리 캐시
