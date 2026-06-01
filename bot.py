@@ -1199,6 +1199,63 @@ async def weekly_score(ctx):
     finally:
         release_db_connection(conn)
 
+
+# =====================================================
+# 🔹 월간 점수
+# =====================================================
+@bot.command(name="월간")
+async def monthly_score(ctx):
+
+    conn = get_db_connection()
+
+    try:
+
+        now = datetime.now(KST)
+
+        start_date = now.replace(
+            day=1
+        ).strftime("%Y-%m-%d")
+
+        end_date = now.strftime(
+            "%Y-%m-%d"
+        )
+
+        with conn.cursor() as cursor:
+
+            cursor.execute("""
+                SELECT name,
+                       COUNT(*) as total
+                FROM attendance
+                WHERE date BETWEEN %s AND %s
+                GROUP BY name
+                ORDER BY total DESC,
+                         name ASC
+            """, (
+                start_date,
+                end_date
+            ))
+
+            rows = cursor.fetchall()
+
+        if not rows:
+            return await ctx.send(
+                "📊 이번 달 기록 없음"
+            )
+
+        text = "\n".join([
+            f"• {r[0]} : {r[1]}점"
+            for r in rows
+        ])
+
+        await ctx.send(
+            f"📊 이번 달 점수\n"
+            f"({start_date} ~ {end_date})\n\n"
+            f"{text}"
+        )
+
+    finally:
+        release_db_connection(conn)
+
 # =====================================================
 # 🔹 기간 조회
 # =====================================================
