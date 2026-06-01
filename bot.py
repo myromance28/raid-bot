@@ -1433,15 +1433,7 @@ async def clear_old_panels():
 
     now = datetime.now(KST)
 
-    if (
-        (now.hour == 6 and now.minute == 0)
-        or
-        (now.hour == 12 and now.minute == 0)
-        or
-        (now.hour == 18 and now.minute == 0)
-        or
-        (now.hour == 0 and now.minute == 0)
-    ):
+    if True:
 
         channel = bot.get_channel(
             BOSS_CHANNEL_ID
