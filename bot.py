@@ -1061,7 +1061,115 @@ async def 출석(ctx):
         release_db_connection(conn)
 
 # =====================================================
-# 🔹 가산점 전체/개별 조회
+# 🔹 가산점 수정 시스템 (NEW 구조)
+# =====================================================
+
+class BonusEditPointModal(discord.ui.Modal, title="⭐ 가산점 수정"):
+
+    points = discord.ui.TextInput(label="새 점수")
+
+    def __init__(self, row_id, row):
+        super().__init__()
+        self.row_id = row_id
+        self.row = row
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        conn = get_db_connection()
+
+        try:
+            with conn.cursor() as cursor:
+
+                cursor.execute("""
+                    UPDATE bonus_points
+                    SET points=%s
+                    WHERE id=%s
+                """, (int(self.points.value), self.row_id))
+
+                conn.commit()
+
+        finally:
+            release_db_connection(conn)
+
+        await interaction.response.send_message(
+            "✅ 수정 완료",
+            ephemeral=True
+        )
+
+
+class BonusRowSelect(discord.ui.Select):
+
+    def __init__(self, rows):
+
+        self.rows = rows
+
+        options = [
+            discord.SelectOption(
+                label=f"{r[1]} [{r[2]}]",
+                description=f"{r[3]}점",
+                value=str(r[0])
+            )
+            for r in rows[:25]
+        ]
+
+        super().__init__(
+            placeholder="수정할 가산점 선택",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        row_id = int(self.values[0])
+        row = next(r for r in self.rows if r[0] == row_id)
+
+        await interaction.response.send_modal(
+            BonusEditPointModal(row_id, row)
+        )
+
+
+class BonusSelectUserModal(discord.ui.Modal, title="🔍 가산점 수정 - 이름 입력"):
+
+    name_input = discord.ui.TextInput(label="이름")
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        name = self.name_input.value
+
+        conn = get_db_connection()
+
+        try:
+            with conn.cursor() as cursor:
+
+                cursor.execute("""
+                    SELECT id, date, time_slot, points
+                    FROM bonus_points
+                    WHERE name=%s
+                    ORDER BY id DESC
+                """, (name,))
+
+                rows = cursor.fetchall()
+
+        finally:
+            release_db_connection(conn)
+
+        if not rows:
+            return await interaction.response.send_message(
+                "❌ 기록 없음",
+                ephemeral=True
+            )
+
+        view = discord.ui.View()
+        view.add_item(BonusRowSelect(rows))
+
+        await interaction.response.send_message(
+            f"📌 {name} 가산점 리스트",
+            view=view,
+            ephemeral=True
+        )
+
+
+# =====================================================
+# 🔹 기존 조회 + 메뉴 UI
 # =====================================================
 
 class BonusSearchModal(discord.ui.Modal, title="🔍 가산점 개별 조회"):
@@ -1086,69 +1194,25 @@ class BonusSearchModal(discord.ui.Modal, title="🔍 가산점 개별 조회"):
 
                 rows = cursor.fetchall()
 
-            if not rows:
-                return await interaction.response.send_message(
-                    "❌ 기록 없음",
-                    ephemeral=True
-                )
-
-            text = "\n".join([
-                f"{r[0]} [{r[1]}] : {r[2]}점"
-                for r in rows
-            ])
-
-            await interaction.response.send_message(
-                f"📌 {name} 가산점 내역\n\n{text}",
-                ephemeral=True
-            )
-
         finally:
             release_db_connection(conn)
 
-class BonusEditModalNew(discord.ui.Modal, title="⭐ 가산점 수정"):
-
-    name = discord.ui.TextInput(label="이름")
-    target = discord.ui.TextInput(label="수정할 총 점수")
-
-    async def on_submit(self, interaction: discord.Interaction):
-
-        name = self.name.value
-        target = int(self.target.value)
-
-        conn = get_db_connection()
-
-        try:
-            with conn.cursor() as cursor:
-
-                cursor.execute("""
-                    SELECT COALESCE(SUM(points), 0)
-                    FROM bonus_points
-                    WHERE name=%s
-                """, (name,))
-
-                current = cursor.fetchone()[0]
-
-                diff = target - current
-
-                cursor.execute("""
-                    INSERT INTO bonus_points(name, points, date, time_slot)
-                    VALUES (%s, %s, %s, %s)
-                """, (
-                    name,
-                    diff,
-                    "ADJUST",
-                    "ADJUST"
-                ))
-
-                conn.commit()
-
-            await interaction.response.send_message(
-                f"⭐ {name} 점수 {diff:+} 조정 완료 (현재→{target})",
+        if not rows:
+            return await interaction.response.send_message(
+                "❌ 기록 없음",
                 ephemeral=True
             )
 
-        finally:
-            release_db_connection(conn)
+        text = "\n".join([
+            f"{r[0]} [{r[1]}] : {r[2]}점"
+            for r in rows
+        ])
+
+        await interaction.response.send_message(
+            f"📌 {name} 가산점 내역\n\n{text}",
+            ephemeral=True
+        )
+
 
 class BonusMenuView(discord.ui.View):
 
@@ -1169,24 +1233,24 @@ class BonusMenuView(discord.ui.View):
 
                 rows = cursor.fetchall()
 
-            if not rows:
-                return await interaction.response.send_message(
-                    "❌ 가산점 없음",
-                    ephemeral=True
-                )
+        finally:
+            release_db_connection(conn)
 
-            text = "\n".join([
-                f"{r[0]} | {r[1]} [{r[2]}] : {r[3]}점"
-                for r in rows
-            ])
-
-            await interaction.response.send_message(
-                f"📊 전체 가산점 (최근 100개)\n\n{text}",
+        if not rows:
+            return await interaction.response.send_message(
+                "❌ 가산점 없음",
                 ephemeral=True
             )
 
-        finally:
-            release_db_connection(conn)
+        text = "\n".join([
+            f"{r[0]} | {r[1]} [{r[2]}] : {r[3]}점"
+            for r in rows
+        ])
+
+        await interaction.response.send_message(
+            f"📊 전체 가산점 (최근 100개)\n\n{text}",
+            ephemeral=True
+        )
 
     @discord.ui.button(label="개별조회", style=discord.ButtonStyle.success)
     async def one_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1202,13 +1266,21 @@ class BonusMenuView(discord.ui.View):
                 ephemeral=True
             )
 
-        await interaction.response.send_modal(BonusEditModalNew())
+        await interaction.response.send_modal(BonusSelectUserModal())
+
+
+# =====================================================
+# 🔹 명령어
+# =====================================================
 
 @bot.command()
 @commands.check(is_admin)
 async def 가산점(ctx):
-    await ctx.send("📌 가산점 관리자 메뉴", view=BonusMenuView())
 
+    await ctx.send(
+        "📌 가산점 관리자 메뉴",
+        view=BonusMenuView()
+    )
 
 # =====================================================
 # 🔹 인원 추가
