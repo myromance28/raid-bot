@@ -1282,6 +1282,41 @@ async def 가산점(ctx):
         view=BonusMenuView()
     )
 
+@bot.command(name="가산점추가")
+@commands.check(is_admin)
+async def bonus_add(ctx, name: str, points: int):
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+
+            now = datetime.now(KST)
+
+            date = now.strftime("%Y-%m-%d")
+            slot = get_slot()
+
+            cursor.execute("""
+                INSERT INTO bonus_points
+                (name, points, date, time_slot)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                name,
+                points,
+                date,
+                slot
+            ))
+
+            conn.commit()
+
+        await ctx.send(
+            f"⭐ {name} +{points}점 지급 완료 ({date} {slot})"
+        )
+
+    finally:
+        release_db_connection(conn)
+
+
 # =====================================================
 # 🔹 인원 추가
 # =====================================================
