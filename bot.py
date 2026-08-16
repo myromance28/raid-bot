@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================
-# RAID BOT - 출석 전용 개편 버전
+# RAID BOT - 출석 전용 테스트 버전
 # =====================================================
 
 import os
@@ -20,14 +20,14 @@ from threading import Thread
 # =====================================================
 KST = timezone(timedelta(hours=9))
 
-# 일반 혈맹 출석창
+# 일반 출석창
 ATTENDANCE_CHANNEL_ID = 1538446431772217405
 
-# 관리자 전용 명령어/비밀번호 방
+# 관리자 전용 비밀번호 방
 ADMIN_CHANNEL_ID = 1538446527968706691
 
 # 출석 패널 / 비밀번호 생성 시간
-ATTENDANCE_HOURS = {3, 9, 15, 21}
+# 테스트 모드: 1분마다 새로운 출석 세션 생성\nTEST_MODE = True\nTEST_INTERVAL_MINUTES = 1\n\n# 실제 운영 시간: 03:00 / 09:00 / 15:00 / 21:00\nATTENDANCE_HOURS = {3, 9, 15, 21}
 
 # =====================================================
 # 🔹 관리자 체크
@@ -367,9 +367,15 @@ class AttendancePasswordModal(
                 ephemeral=True
             )
 
-        # 비밀번호 세션은 생성 시각 기준 3시간 동안 유효
+        # 테스트 모드에서는 각 분의 세션을 1분 동안만 유효하게 한다.
+        # 운영 모드에서는 기존처럼 생성 시각 기준 3시간 동안 유효하다.
         try:
-            session_hour = int(current_slot)
+            if TEST_MODE:
+                session_hour = int(current_slot[:2])
+                session_minute = int(current_slot[2:4])
+            else:
+                session_hour = int(current_slot)
+                session_minute = 0
         except Exception:
             return await interaction.response.send_message(
                 "❌ 출석 세션 정보를 확인할 수 없습니다.",
@@ -378,14 +384,14 @@ class AttendancePasswordModal(
 
         session_start = now.replace(
             hour=session_hour,
-            minute=0,
+            minute=session_minute,
             second=0,
             microsecond=0
         )
 
-        # 3시 세션은 당일 3시부터 6시까지,
-        # 9시 세션은 9시부터 12시까지 등
-        if now < session_start or now >= session_start + timedelta(hours=3):
+        session_duration = timedelta(minutes=1) if TEST_MODE else timedelta(hours=3)
+
+        if now < session_start or now >= session_start + session_duration:
             return await interaction.response.send_message(
                 "❌ 출석 가능 시간이 종료되었습니다.",
                 ephemeral=True
@@ -492,17 +498,23 @@ async def automatic_attendance_panel():
 
     now = datetime.now(KST)
 
-    # 03:00 / 09:00 / 15:00 / 21:00
-    if now.hour not in ATTENDANCE_HOURS:
-        return
-
-    if now.minute != 0:
-        return
-
     date_text = now.strftime("%Y-%m-%d")
-    slot_text = get_current_slot(now.hour)
 
-    panel_key = f"{date_text}_{slot_text}"
+    if TEST_MODE:
+        # 테스트 모드에서는 매 분을 별도의 출석 세션으로 사용
+        # 예: 22:01 -> 2201, 22:02 -> 2202
+        slot_text = now.strftime("%H%M")
+        panel_key = f"{date_text}_{slot_text}"
+    else:
+        # 운영 모드: 03:00 / 09:00 / 15:00 / 21:00
+        if now.hour not in ATTENDANCE_HOURS:
+            return
+
+        if now.minute != 0:
+            return
+
+        slot_text = get_current_slot(now.hour)
+        panel_key = f"{date_text}_{slot_text}"
 
     # 재실행/루프 중복 방지
     if last_panel_key == panel_key:
@@ -544,12 +556,15 @@ async def automatic_attendance_panel():
     )
 
     try:
-        # 일반 혈맹 출석창
+        # 일반 출석창
+        validity_text = "1분" if TEST_MODE else "3시간"
+
         await attendance_channel.send(
             f"📢 **출석 시간입니다!**\n"
-            f"🕒 {now.strftime('%H:%M')} 출석\n\n"
+            f"🕒 {now.strftime('%H:%M:%S')} 출석\n\n"
             f"아래 버튼을 눌러 출석해주세요.\n"
-            f"출석 시 **1점**이 지급됩니다.",
+            f"출석 시 **1점**이 지급됩니다.\n"
+            f"⏰ 유효시간: {validity_text}",
             view=AttendanceView()
         )
 
@@ -557,8 +572,8 @@ async def automatic_attendance_panel():
         await admin_channel.send(
             f"🔐 **출석 비밀번호**\n\n"
             f"```{password}```\n\n"
-            f"🕒 출석 시간: {now.strftime('%H:%M')}\n"
-            f"⏰ 유효시간: 3시간\n"
+            f"🕒 출석 시간: {now.strftime('%H:%M:%S')}\n"
+            f"⏰ 유효시간: {validity_text}\n"
             f"⚠️ 이 번호는 혈맹원에게 알려주세요."
         )
 
@@ -582,6 +597,12 @@ async def automatic_channel_cleanup():
 
     now = datetime.now(KST)
 
+    if TEST_MODE:
+        # 테스트 모드: 매 분 기존 패널/비밀번호를 지우고 새 세션 준비
+        await clear_both_channels()
+        return
+
+    # 운영 모드:
     # 03:00 생성 → 06:00 삭제
     # 09:00 생성 → 12:00 삭제
     # 15:00 생성 → 18:00 삭제
@@ -649,29 +670,6 @@ async def db_reset(ctx):
                 "RESTART IDENTITY CASCADE"
             )
 
-            # 기존 버전의 보스/득템/가산점/혈맹원 데이터도 초기화
-            # PostgreSQL은 TRUNCATE TABLE IF EXISTS 문법을 지원하지 않으므로
-            # 테이블이 실제로 존재하는 경우에만 TRUNCATE한다.
-            legacy_tables = (
-                "attendance",
-                "members",
-                "drops",
-                "boss_list",
-                "bonus_points",
-            )
-
-            for table in legacy_tables:
-                cursor.execute(
-                    "SELECT to_regclass(%s)",
-                    (table,)
-                )
-                exists = cursor.fetchone()[0]
-
-                if exists is not None:
-                    cursor.execute(
-                        f'TRUNCATE TABLE "{table}" '
-                        f'RESTART IDENTITY CASCADE'
-                    )
 
             conn.commit()
 
@@ -685,13 +683,9 @@ async def db_reset(ctx):
         current_slot = None
 
         await ctx.send(
-            "🧹 **DB 전체 초기화 완료**\n\n"
+            "🧹 **출석 DB 초기화 완료**\n\n"
             "• 모든 출석 기록 삭제\n"
-            "• 출석 비밀번호 세션 초기화\n"
-            "• 기존 혈맹원 데이터 삭제\n"
-            "• 기존 보스 데이터 삭제\n"
-            "• 기존 득템 데이터 삭제\n"
-            "• 기존 가산점 데이터 삭제\n\n"
+            "• 출석 비밀번호 세션 초기화\n\n"
             "이제 Discord ID 기준으로 "
             "출석 기록을 새로 저장합니다."
         )
