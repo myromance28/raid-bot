@@ -1469,34 +1469,43 @@ async def bonus_command(ctx):
     )
 
 
-@bot.command(name="보스추가")
+@bot.command(name="보스추가", aliases=["보스 추가"])
 async def boss_add(ctx, *, boss_name: str = ""):
     if not is_admin_channel(ctx):
         return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
-    name = boss_name.strip()
+    name = " ".join(boss_name.split()).strip()
     if not name:
         return await ctx.send("❌ 사용법: `!보스추가 이프리트`")
-    inserted = await run_db(add_boss_db, name)
-    if not inserted:
-        return await ctx.send(f"⚠️ **{name}**은 이미 등록되어 있습니다.")
-    boss_names.append(name)
-    await ctx.send(f"🔴 **{name}** 보스가 추가되었습니다.")
-    await send_boss_panel()
+    try:
+        inserted = await run_db(add_boss_db, name)
+        if not inserted:
+            return await ctx.send(f"⚠️ **{name}**은 이미 등록되어 있습니다.")
+        if name not in boss_names:
+            boss_names.append(name)
+        await ctx.send(f"🔴 **{name}** 보스가 추가되었습니다.")
+        await send_boss_panel()
+    except Exception as e:
+        print(f"[보스추가 오류] {type(e).__name__}: {e}")
+        await ctx.send(f"❌ 보스 추가 중 DB 오류가 발생했습니다.\n```{e}```")
 
 
-@bot.command(name="보스삭제")
+@bot.command(name="보스삭제", aliases=["보스 삭제"])
 async def boss_delete(ctx, *, boss_name: str = ""):
     if not is_admin_channel(ctx):
         return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
-    name = boss_name.strip()
+    name = " ".join(boss_name.split()).strip()
     if not name:
         return await ctx.send("❌ 사용법: `!보스삭제 이프리트`")
-    deleted = await run_db(delete_boss_db, name)
-    if not deleted:
-        return await ctx.send(f"❌ **{name}** 보스를 찾을 수 없습니다.")
-    boss_names[:] = [x for x in boss_names if x != name]
-    await ctx.send(f"🗑️ **{name}** 보스가 삭제되었습니다.")
-    await send_boss_panel()
+    try:
+        deleted = await run_db(delete_boss_db, name)
+        if not deleted:
+            return await ctx.send(f"❌ **{name}** 보스를 찾을 수 없습니다.")
+        boss_names[:] = [x for x in boss_names if x != name]
+        await ctx.send(f"🗑️ **{name}** 보스가 삭제되었습니다.")
+        await send_boss_panel()
+    except Exception as e:
+        print(f"[보스삭제 오류] {type(e).__name__}: {e}")
+        await ctx.send(f"❌ 보스 삭제 중 DB 오류가 발생했습니다.\n```{e}```")
 
 
 @bot.command(name="DB초기화")
