@@ -222,18 +222,39 @@ def load_active_session():
             return None
 
         try:
-            session_hour = int(slot_text)
+            if TEST_MODE:
+                # 테스트 모드의 세션은 HHMM 형식 (예: 2238)
+                if len(str(slot_text)) != 4:
+                    return None
+                session_hour = int(str(slot_text)[:2])
+                session_minute = int(str(slot_text)[2:4])
+
+                if not (0 <= session_hour <= 23 and 0 <= session_minute <= 59):
+                    return None
+            else:
+                # 운영 모드의 세션은 HH 형식 (예: 21)
+                session_hour = int(slot_text)
+                session_minute = 0
+
+                if not (0 <= session_hour <= 23):
+                    return None
         except Exception:
             return None
 
         session_start = now.replace(
             hour=session_hour,
-            minute=0,
+            minute=session_minute,
             second=0,
             microsecond=0
         )
 
-        if session_start <= now < session_start + timedelta(hours=3):
+        session_duration = (
+            timedelta(minutes=1)
+            if TEST_MODE
+            else timedelta(hours=3)
+        )
+
+        if session_start <= now < session_start + session_duration:
             return row
 
         return None
