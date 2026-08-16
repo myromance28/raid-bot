@@ -27,7 +27,12 @@ ATTENDANCE_CHANNEL_ID = 1538446431772217405
 ADMIN_CHANNEL_ID = 1538446527968706691
 
 # 출석 패널 / 비밀번호 생성 시간
-# 테스트 모드: 1분마다 새로운 출석 세션 생성\nTEST_MODE = True\nTEST_INTERVAL_MINUTES = 1\n\n# 실제 운영 시간: 03:00 / 09:00 / 15:00 / 21:00\nATTENDANCE_HOURS = {3, 9, 15, 21}
+# 테스트 모드: 1분마다 새로운 출석 세션 생성
+TEST_MODE = True
+TEST_INTERVAL_MINUTES = 1
+
+# 실제 운영 시간: 03:00 / 09:00 / 15:00 / 21:00
+ATTENDANCE_HOURS = {3, 9, 15, 21}
 
 # =====================================================
 # 🔹 관리자 체크
@@ -556,6 +561,11 @@ async def automatic_attendance_panel():
     )
 
     try:
+        # 테스트 모드에서는 새 세션을 만들기 전에 이전 패널/비밀번호를 삭제한다.
+        # 별도의 cleanup 루프가 같은 분에 새 패널을 지우지 않도록 한다.
+        if TEST_MODE:
+            await clear_both_channels()
+
         # 일반 출석창
         validity_text = "1분" if TEST_MODE else "3시간"
 
@@ -598,8 +608,8 @@ async def automatic_channel_cleanup():
     now = datetime.now(KST)
 
     if TEST_MODE:
-        # 테스트 모드: 매 분 기존 패널/비밀번호를 지우고 새 세션 준비
-        await clear_both_channels()
+        # 테스트 모드에서는 automatic_attendance_panel이
+        # 새 패널 생성 직전에 이전 메시지를 삭제하므로 여기서는 아무것도 하지 않는다.
         return
 
     # 운영 모드:
@@ -759,6 +769,10 @@ async def on_ready():
     )
     print(
         f"관리자채널: {ADMIN_CHANNEL_ID}"
+    )
+    print(
+        f"테스트모드: {TEST_MODE}, "
+        f"출석패널 주기: {TEST_INTERVAL_MINUTES}분"
     )
 
 
