@@ -607,6 +607,73 @@ async def send_boss_panel():
 
 
 
+class DropDeleteConfirmView(discord.ui.View):
+    def __init__(self, drop_id, drop_text):
+        super().__init__(timeout=60)
+        self.drop_id = drop_id
+        self.drop_text = drop_text
+
+    @discord.ui.button(
+        label="삭제",
+        style=discord.ButtonStyle.success
+    )
+    async def delete_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not is_admin_channel(interaction):
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        try:
+            deleted = await run_db(delete_drop_db, self.drop_id)
+
+            if deleted:
+                button.disabled = True
+                for child in self.children:
+                    child.disabled = True
+
+                await interaction.response.edit_message(
+                    content=(
+                        "🗑️ **삭제 완료**\n\n"
+                        f"`{self.drop_text}`"
+                    ),
+                    view=self
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ 해당 득템 내역을 찾을 수 없습니다.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            print(f"[득템 삭제 오류] {type(e).__name__}: {e}")
+            await interaction.response.send_message(
+                f"❌ 득템 삭제 중 오류가 발생했습니다.\n```{e}```",
+                ephemeral=True
+            )
+
+    @discord.ui.button(
+        label="취소",
+        style=discord.ButtonStyle.danger
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="↩️ **삭제가 취소되었습니다.**",
+            view=self
+        )
+
+
 class DropDeleteSelect(discord.ui.Select):
     def __init__(self, drops):
         self.drops = drops
@@ -614,8 +681,12 @@ class DropDeleteSelect(discord.ui.Select):
         options = []
         for row in drops[:25]:
             drop_id, boss_name, drop_name, username, created_at = row
-            label = f"{boss_name} - {drop_name}"[:100]
-            desc = f"{username} / {created_at.strftime('%m-%d %H:%M') if created_at else ''}"[:100]
+            label = f"{drop_name} - {boss_name}"[:100]
+            desc = (
+                f"{username} / "
+                f"{created_at.strftime('%m-%d %H:%M') if created_at else ''}"
+            )[:100]
+
             options.append(
                 discord.SelectOption(
                     label=label,
@@ -639,24 +710,38 @@ class DropDeleteSelect(discord.ui.Select):
             )
 
         drop_id = int(self.values[0])
-        try:
-            deleted = await run_db(delete_drop_db, drop_id)
-            if deleted:
-                await interaction.response.send_message(
-                    "🗑️ 선택한 득템 내역을 삭제했습니다.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    "❌ 해당 득템 내역을 찾을 수 없습니다.",
-                    ephemeral=True
-                )
-        except Exception as e:
-            print(f"[득템 삭제 오류] {type(e).__name__}: {e}")
-            await interaction.response.send_message(
-                f"❌ 득템 삭제 중 오류가 발생했습니다.\n```{e}```",
+
+        selected = next(
+            (row for row in self.drops if row[0] == drop_id),
+            None
+        )
+
+        if selected is None:
+            return await interaction.response.send_message(
+                "❌ 선택한 득템 내역을 찾을 수 없습니다.",
                 ephemeral=True
             )
+
+        _, boss_name, drop_name, username, created_at = selected
+        time_text = (
+            created_at.strftime("%m-%d %H:%M")
+            if created_at else "-"
+        )
+
+        drop_text = (
+            f"{drop_name} - {boss_name} - "
+            f"{username} - {time_text}"
+        )
+
+        await interaction.response.edit_message(
+            content=(
+                "⚠️ **정말 삭제하시겠습니까?**\n\n"
+                f"`{drop_text}`"
+            ),
+            view=DropDeleteConfirmView(drop_id, drop_text)
+        )
+
+
 
 
 class DropListView(discord.ui.View):
@@ -673,7 +758,7 @@ def load_all_drops():
             cursor.execute("""
                 SELECT id, boss_name, drop_name, username, created_at
                 FROM boss_drops
-                ORDER BY created_at DESC, id DESC
+                ORDER BY created_at ASC, id ASC
             """)
             return cursor.fetchall()
     finally:
@@ -1730,32 +1815,77 @@ async def drop_list_command(ctx):
                 "현재 등록된 득템 내역이 없습니다."
             )
 
-        # 한 줄에 하나의 득템 기록을 가로 형태로 표시
-        # 예: 피닉스 - 깃털 - 홍길동 - 01:25
-        lines = ["🎁 **전체 득템 내역**", "```"]
+        def display_width(value):
+            import unicodedata
+            width = 0
+            for ch in str(value):
+                width += 2 if unicodedata.east_asian_width(ch) in "WFA" else 1
+            return width
 
+        def fit_cell(value, width):
+            value = str(value)
+            result = ""
+            current = 0
+
+            for ch in value:
+                ch_width = display_width(ch)
+                if current + ch_width > width:
+                    break
+                result += ch
+                current += ch_width
+
+            return result + " " * max(0, width - current)
+
+        # 등록 순서대로 표시:
+        # 득템이름 - 보스 - 등록자 - 날짜
+        headers = ["득템이름", "보스", "등록자", "날짜"]
+
+        rows = []
         for drop_id, boss_name, drop_name, username, created_at in drops:
             time_text = (
                 created_at.strftime("%m-%d %H:%M")
-                if created_at else "시간 없음"
+                if created_at else "-"
             )
-            lines.append(
-                f"{boss_name} - {drop_name} - {username} - {time_text}"
+            rows.append([
+                drop_name,
+                boss_name,
+                username,
+                time_text
+            ])
+
+        # Discord 코드블록 안에서 엑셀처럼 보이도록 고정 폭 표 구성
+        widths = [14, 12, 12, 14]
+
+        table_lines = [
+            " | ".join(
+                fit_cell(headers[i], widths[i])
+                for i in range(4)
+            ),
+            "-+-".join("-" * width for width in widths)
+        ]
+
+        for row in rows:
+            table_lines.append(
+                " | ".join(
+                    fit_cell(row[i], widths[i])
+                    for i in range(4)
+                )
             )
 
-        lines.append("```")
-
-        # Discord 메시지 길이 제한 대응
+        # Discord 2000자 제한 대응
         chunks = []
-        current = ""
-        for line in lines:
-            if len(current) + len(line) + 1 > 1900:
-                chunks.append(current)
-                current = ""
-            current += line + "\n"
+        current_lines = ["🎁 **전체 득템 내역**", "```"]
 
-        if current.strip():
-            chunks.append(current)
+        for line in table_lines:
+            if sum(len(x) + 1 for x in current_lines) + len(line) + 4 > 1900:
+                current_lines.append("```")
+                chunks.append("\n".join(current_lines))
+                current_lines = ["```"]
+
+            current_lines.append(line)
+
+        current_lines.append("```")
+        chunks.append("\n".join(current_lines))
 
         for index, chunk in enumerate(chunks):
             if index == len(chunks) - 1:
