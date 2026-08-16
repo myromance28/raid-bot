@@ -519,7 +519,8 @@ def add_boss_db(name):
                 "ON CONFLICT (boss_name) DO NOTHING",
                 (name,)
             )
-            ok = cursor.fetchone() is not None
+            # RETURNING을 사용하지 않으므로 fetchone()을 호출하지 않는다.
+            ok = cursor.rowcount > 0
         conn.commit()
         return ok
     except Exception:
@@ -527,7 +528,6 @@ def add_boss_db(name):
         raise
     finally:
         release_db_connection(conn)
-
 
 def delete_boss_db(name):
     conn = get_db_connection()
