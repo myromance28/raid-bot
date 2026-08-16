@@ -516,7 +516,7 @@ def add_boss_db(name):
         with conn.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO boss_list (boss_name) VALUES (%s) "
-                "ON CONFLICT (boss_name) DO NOTHING RETURNING id",
+                "ON CONFLICT (boss_name) DO NOTHING",
                 (name,)
             )
             ok = cursor.fetchone() is not None
