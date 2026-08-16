@@ -564,6 +564,8 @@ def save_boss_drop_db(boss_name, drop_name, user_id, username):
 
 async def send_boss_panel():
     global boss_panel_message_id
+    # 보스 버튼은 출석 비밀번호가 올라오는 관리자 채팅방에 표시한다.
+    # 일반 혈맹 출석채널의 출석 패널에는 보스 버튼을 넣지 않는다.
     admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
     if admin_channel is None:
         return
