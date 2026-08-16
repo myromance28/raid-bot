@@ -643,23 +643,61 @@ bot.add_view(AttendanceView())
 # =====================================================
 @bot.command(name="DB초기화")
 async def db_reset(ctx):
-
-    # 모든 명령어는 관리자 전용방에서만 작동
+    # 관리자 전용방에서만 실행
     if not is_admin_channel(ctx):
         return await ctx.send(
             "❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다."
+        )
+
+    warning = await ctx.send(
+        "⚠️ **DB 전체 초기화 경고** ⚠️
+
+"
+        "🚨 **주의 요망** 🚨
+"
+        "이 작업을 진행하면 현재 저장된 **모든 출석 정보가 초기화됩니다.**
+
+"
+        "삭제되는 정보:
+"
+        "• 모든 출석 기록
+"
+        "• 출석 비밀번호 세션
+
+"
+        "⚠️ **초기화 후에는 데이터를 복구할 수 없습니다.**
+
+"
+        "초기화를 진행하려면 아래 문구를 **정확하게 입력하세요.**
+
+"
+        "```초기화 동의```
+
+"
+        "⏰ 30초 이내에 입력해야 합니다."
+    )
+
+    def check(message):
+        return (
+            message.author.id == ctx.author.id
+            and message.channel.id == ctx.channel.id
+            and message.content.strip() == "초기화 동의"
+        )
+
+    try:
+        await bot.wait_for("message", timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        return await ctx.send(
+            "⌛ **DB 초기화가 취소되었습니다.**
+"
+            "30초 안에 `초기화 동의`가 입력되지 않았습니다."
         )
 
     conn = get_db_connection()
 
     try:
         with conn.cursor() as cursor:
-            # 새 출석 데이터 전부 삭제
-            cursor.execute(
-                "TRUNCATE TABLE attendance_v2 RESTART IDENTITY"
-            )
-
-            # 현재 출석봇 데이터 초기화
+            # 현재 출석봇에서 사용하는 데이터 초기화
             cursor.execute(
                 "TRUNCATE TABLE attendance_v2 "
                 "RESTART IDENTITY CASCADE"
@@ -670,22 +708,30 @@ async def db_reset(ctx):
                 "RESTART IDENTITY CASCADE"
             )
 
-
             conn.commit()
 
-        # 현재 출석 세션도 초기화
+        # 현재 메모리에 저장된 출석 세션도 초기화
         global current_password
         global current_date
         global current_slot
+        global last_panel_key
 
         current_password = None
         current_date = None
         current_slot = None
+        last_panel_key = None
 
         await ctx.send(
-            "🧹 **출석 DB 초기화 완료**\n\n"
-            "• 모든 출석 기록 삭제\n"
-            "• 출석 비밀번호 세션 초기화\n\n"
+            "🧹 **DB 전체 초기화 완료**
+
+"
+            "• 모든 출석 기록 삭제
+"
+            "• 출석 비밀번호 세션 초기화
+"
+            "• 현재 출석 세션 초기화 완료
+
+"
             "이제 Discord ID 기준으로 "
             "출석 기록을 새로 저장합니다."
         )
@@ -694,7 +740,8 @@ async def db_reset(ctx):
         conn.rollback()
 
         await ctx.send(
-            f"❌ DB 초기화 실패\n```{e}```"
+            f"❌ **DB 초기화 실패**
+```{e}```"
         )
 
     finally:
