@@ -112,6 +112,8 @@ bonus_slot = None
 bonus_points = None
 bonus_created_at = None
 bonus_message_ids = set()
+boss_names = []
+boss_panel_message_id = None
 
 
 def get_current_slot(hour=None):
@@ -187,6 +189,24 @@ def init_database():
                     password TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(date, time_slot)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS boss_list (
+                    id SERIAL PRIMARY KEY,
+                    boss_name TEXT NOT NULL UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS boss_drops (
+                    id SERIAL PRIMARY KEY,
+                    boss_name TEXT NOT NULL,
+                    drop_name TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -475,6 +495,150 @@ def delete_bonus_session(date_text, slot_text):
 
     finally:
         release_db_connection(conn)
+
+
+# =====================================================
+# 🔹 보스 기능
+# =====================================================
+def load_bosses():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT boss_name FROM boss_list ORDER BY id ASC")
+            return [row[0] for row in cursor.fetchall()]
+    finally:
+        release_db_connection(conn)
+
+
+def add_boss_db(name):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO boss_list (boss_name) VALUES (%s) "
+                "ON CONFLICT (boss_name) DO NOTHING RETURNING id",
+                (name,)
+            )
+            ok = cursor.fetchone() is not None
+        conn.commit()
+        return ok
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def delete_boss_db(name):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM boss_list WHERE boss_name=%s", (name,))
+            ok = cursor.rowcount > 0
+        conn.commit()
+        return ok
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def save_boss_drop_db(boss_name, drop_name, user_id, username):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO boss_drops "
+                "(boss_name, drop_name, user_id, username) "
+                "VALUES (%s,%s,%s,%s)",
+                (boss_name, drop_name, user_id, username)
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+async def send_boss_panel():
+    global boss_panel_message_id
+    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+    if admin_channel is None:
+        return
+
+    if boss_panel_message_id:
+        try:
+            old = await admin_channel.fetch_message(boss_panel_message_id)
+            await old.delete()
+        except Exception:
+            pass
+        boss_panel_message_id = None
+
+    if not boss_names:
+        return
+
+    msg = await admin_channel.send(
+        "👹 **보스 목록**\n"
+        "아래 빨간색 버튼을 눌러 득템 이름을 입력하세요.",
+        view=BossPanelView()
+    )
+    boss_panel_message_id = msg.id
+
+
+class BossDropModal(discord.ui.Modal, title="🎁 득템 이름 입력"):
+    drop_name = discord.ui.TextInput(
+        label="득템 이름",
+        placeholder="획득한 아이템 이름을 입력하세요.",
+        min_length=1,
+        max_length=100,
+        required=True
+    )
+
+    def __init__(self, boss_name):
+        super().__init__()
+        self.boss_name = boss_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            item = str(self.drop_name.value).strip()
+            await run_db(
+                save_boss_drop_db,
+                self.boss_name,
+                item,
+                interaction.user.id,
+                interaction.user.display_name
+            )
+            await interaction.followup.send(
+                f"🎁 **득템 등록 완료**\n"
+                f"👹 보스: **{self.boss_name}**\n"
+                f"💎 득템: **{item}**",
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"[보스 득템 오류] {type(e).__name__}: {e}")
+            await interaction.followup.send(
+                "❌ 득템 저장 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+class BossButton(discord.ui.Button):
+    def __init__(self, boss_name):
+        super().__init__(label=boss_name, style=discord.ButtonStyle.danger)
+        self.boss_name = boss_name
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(BossDropModal(self.boss_name))
+
+
+class BossPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for name in boss_names:
+            self.add_item(BossButton(name))
 
 
 # =====================================================
@@ -1171,6 +1335,7 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        global boss_panel_message_id
         if interaction.channel_id != ADMIN_CHANNEL_ID:
             return await interaction.response.send_message(
                 "❌ 관리자 전용방에서만 초기화할 수 있습니다.",
@@ -1211,6 +1376,11 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
                             "RESTART IDENTITY CASCADE"
                         )
 
+                        cursor.execute(
+                            "TRUNCATE TABLE boss_drops, boss_list "
+                            "RESTART IDENTITY CASCADE"
+                        )
+
                         connection.commit()
                 except Exception:
                     connection.rollback()
@@ -1241,6 +1411,8 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             bonus_slot = None
             bonus_points = None
             bonus_created_at = None
+            boss_names.clear()
+            boss_panel_message_id = None
 
             # DB 초기화 시 일반 출석창의 가산점 패널도 제거
             attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
@@ -1295,6 +1467,36 @@ async def bonus_command(ctx):
         "일반 출석창에 나타나지 않습니다.",
         view=BonusPanelView()
     )
+
+
+@bot.command(name="보스추가")
+async def boss_add(ctx, *, boss_name: str = ""):
+    if not is_admin_channel(ctx):
+        return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+    name = boss_name.strip()
+    if not name:
+        return await ctx.send("❌ 사용법: `!보스추가 이프리트`")
+    inserted = await run_db(add_boss_db, name)
+    if not inserted:
+        return await ctx.send(f"⚠️ **{name}**은 이미 등록되어 있습니다.")
+    boss_names.append(name)
+    await ctx.send(f"🔴 **{name}** 보스가 추가되었습니다.")
+    await send_boss_panel()
+
+
+@bot.command(name="보스삭제")
+async def boss_delete(ctx, *, boss_name: str = ""):
+    if not is_admin_channel(ctx):
+        return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+    name = boss_name.strip()
+    if not name:
+        return await ctx.send("❌ 사용법: `!보스삭제 이프리트`")
+    deleted = await run_db(delete_boss_db, name)
+    if not deleted:
+        return await ctx.send(f"❌ **{name}** 보스를 찾을 수 없습니다.")
+    boss_names[:] = [x for x in boss_names if x != name]
+    await ctx.send(f"🗑️ **{name}** 보스가 삭제되었습니다.")
+    await send_boss_panel()
 
 
 @bot.command(name="DB초기화")
@@ -1366,6 +1568,12 @@ async def on_command_error(ctx, error):
 # =====================================================
 @bot.event
 async def on_ready():
+    try:
+        boss_names[:] = await run_db(load_bosses)
+    except Exception as e:
+        print(f"[보스 목록 로드 오류] {e}")
+        boss_names.clear()
+
 
     if not automatic_attendance_panel.is_running():
         automatic_attendance_panel.start()
