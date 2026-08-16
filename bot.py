@@ -638,9 +638,7 @@ async def db_reset(ctx):
                 "TRUNCATE TABLE attendance_v2 RESTART IDENTITY"
             )
 
-            # 현재 출석봇에서 실제 사용하는 테이블만 초기화
-            # PostgreSQL에서는 TRUNCATE TABLE IF EXISTS 문법을 지원하지 않으므로
-            # 존재가 보장된 테이블만 직접 초기화한다.
+            # 현재 출석봇 데이터 초기화
             cursor.execute(
                 "TRUNCATE TABLE attendance_v2 "
                 "RESTART IDENTITY CASCADE"
@@ -650,6 +648,30 @@ async def db_reset(ctx):
                 "TRUNCATE TABLE attendance_sessions "
                 "RESTART IDENTITY CASCADE"
             )
+
+            # 기존 버전의 보스/득템/가산점/혈맹원 데이터도 초기화
+            # PostgreSQL은 TRUNCATE TABLE IF EXISTS 문법을 지원하지 않으므로
+            # 테이블이 실제로 존재하는 경우에만 TRUNCATE한다.
+            legacy_tables = (
+                "attendance",
+                "members",
+                "drops",
+                "boss_list",
+                "bonus_points",
+            )
+
+            for table in legacy_tables:
+                cursor.execute(
+                    "SELECT to_regclass(%s)",
+                    (table,)
+                )
+                exists = cursor.fetchone()[0]
+
+                if exists is not None:
+                    cursor.execute(
+                        f'TRUNCATE TABLE "{table}" '
+                        f'RESTART IDENTITY CASCADE'
+                    )
 
             conn.commit()
 
@@ -663,9 +685,13 @@ async def db_reset(ctx):
         current_slot = None
 
         await ctx.send(
-            "🧹 **출석 DB 초기화 완료**\n\n"
+            "🧹 **DB 전체 초기화 완료**\n\n"
             "• 모든 출석 기록 삭제\n"
-            "• 출석 비밀번호 세션 초기화\n\n"
+            "• 출석 비밀번호 세션 초기화\n"
+            "• 기존 혈맹원 데이터 삭제\n"
+            "• 기존 보스 데이터 삭제\n"
+            "• 기존 득템 데이터 삭제\n"
+            "• 기존 가산점 데이터 삭제\n\n"
             "이제 Discord ID 기준으로 "
             "출석 기록을 새로 저장합니다."
         )
