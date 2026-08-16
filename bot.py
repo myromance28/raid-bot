@@ -621,6 +621,14 @@ class BonusButton(discord.ui.Button):
         )
 
 
+class StandaloneBonusView(discord.ui.View):
+    """일반 출석창에 별도로 표시되는 가산점 전용 패널."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(BonusButton())
+
+
 class BonusPointButton(discord.ui.Button):
     def __init__(self, points):
         super().__init__(
@@ -681,15 +689,29 @@ class BonusPointButton(discord.ui.Button):
             bonus_points = self.points
             bonus_created_at = now
 
+            # 관리자방에는 비밀번호만 생성하고,
+            # 일반 출석창에는 출석 패널과 별개인 가산점 버튼을 즉시 전송한다.
             await interaction.response.send_message(
                 f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
                 f"```{password}```\n\n"
-                f"⏰ 유효시간: 1시간\n"
-                f"👥 지금부터 생성되는 출석 패널에 "
-                f"일반 출석창 **🔵 가산점** 버튼이 표시됩니다.",
+                f"⏰ 유효시간: 1시간",
                 ephemeral=False
             )
+
+            attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+
+            if attendance_channel is not None:
+                # 기존 출석 패널/메시지는 건드리지 않고
+                # 가산점 패널만 새 메시지로 추가한다.
+                bonus_message = await attendance_channel.send(
+                    "🔵 **가산점 패널**\n"
+                    f"⭐ 현재 가산점: **+{self.points}점**\n"
+                    "아래 파란색 버튼을 눌러 가산점 비밀번호를 입력하세요.\n"
+                    "⏰ 유효시간: 1시간",
+                    view=StandaloneBonusView()
+                )
+                bonus_message_ids.add(bonus_message.id)
 
         except Exception as e:
             print(
@@ -715,17 +737,6 @@ class AttendanceView(discord.ui.View):
 
     def __init__(self):
         super().__init__(timeout=None)
-
-        # 자동 출석 패널에서는 가산점 세션이 활성화된 경우에만
-        # 파란색 가산점 버튼을 추가한다.
-        # 가산점 세션은 !가산점 명령어로만 생성된다.
-        if (
-            bonus_password is not None
-            and bonus_date is not None
-            and bonus_slot is not None
-            and bonus_points is not None
-        ):
-            self.add_item(BonusButton())
 
     @discord.ui.button(
         label="✅ 출석하기",
@@ -1081,6 +1092,19 @@ async def automatic_channel_cleanup():
             bonus_points = None
             bonus_created_at = None
 
+            # 1시간이 지나면 일반 출석창에 별도로 표시했던
+            # 가산점 패널도 삭제한다.
+            attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+            if attendance_channel is not None:
+                for message_id in list(bonus_message_ids):
+                    try:
+                        message = await attendance_channel.fetch_message(message_id)
+                        await message.delete()
+                    except Exception:
+                        pass
+                    finally:
+                        bonus_message_ids.discard(message_id)
+
             if old_date and old_slot:
                 try:
                     await run_db(
@@ -1217,6 +1241,18 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             bonus_slot = None
             bonus_points = None
             bonus_created_at = None
+
+            # DB 초기화 시 일반 출석창의 가산점 패널도 제거
+            attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+            if attendance_channel is not None:
+                for message_id in list(bonus_message_ids):
+                    try:
+                        message = await attendance_channel.fetch_message(message_id)
+                        await message.delete()
+                    except Exception:
+                        pass
+                    finally:
+                        bonus_message_ids.discard(message_id)
 
             await interaction.followup.send(
                 "🧹 **DB 전체 초기화 완료**\n\n"
