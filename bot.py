@@ -504,7 +504,7 @@ def load_bosses():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT boss_name FROM boss_list ORDER BY id ASC")
+            cursor.execute("SELECT boss_name FROM boss_list ORDER BY boss_name ASC")
             return [row[0] for row in cursor.fetchall()]
     finally:
         release_db_connection(conn)
@@ -1231,6 +1231,10 @@ async def automatic_attendance_panel():
             f"⏰ 유효시간: {validity_text}\n"
             f"⚠️ 이 번호는 혈맹원에게 알려주세요."
         )
+
+        # 출석 비밀번호가 생성될 때마다 관리자방에
+        # 현재 DB에 등록된 전체 보스 버튼을 표시한다.
+        await send_boss_panel()
 
         last_panel_key = panel_key
 
