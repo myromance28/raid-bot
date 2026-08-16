@@ -1903,6 +1903,176 @@ async def drop_list_command(ctx):
         )
 
 
+
+def load_weekly_scores(start_date, end_date):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    user_id,
+                    MAX(username) AS username,
+                    SUM(attendance_points) AS attendance_points,
+                    SUM(bonus_points) AS bonus_points,
+                    SUM(attendance_points + bonus_points) AS total_points
+                FROM (
+                    SELECT
+                        user_id,
+                        username,
+                        COALESCE(SUM(points), 0) AS attendance_points,
+                        0::BIGINT AS bonus_points
+                    FROM attendance_v2
+                    WHERE date >= %s
+                      AND date <= %s
+                    GROUP BY user_id, username
+
+                    UNION ALL
+
+                    SELECT
+                        user_id,
+                        username,
+                        0::BIGINT AS attendance_points,
+                        COALESCE(SUM(points), 0) AS bonus_points
+                    FROM bonus_attendance
+                    WHERE date >= %s
+                      AND date <= %s
+                    GROUP BY user_id, username
+                ) AS score_rows
+                GROUP BY user_id
+                ORDER BY total_points DESC, username ASC
+            """, (
+                start_date,
+                end_date,
+                start_date,
+                end_date
+            ))
+
+            return cursor.fetchall()
+
+    finally:
+        release_db_connection(conn)
+
+
+def make_weekly_table(rows, period_name, start_date, end_date):
+    if not rows:
+        return (
+            f"📊 **{period_name} 주간 점수**\n\n"
+            f"기간: `{start_date} 00:00 ~ {end_date} 현재`\n\n"
+            "해당 기간에 기록된 점수가 없습니다."
+        )
+
+    def display_width(value):
+        import unicodedata
+        return sum(
+            2 if unicodedata.east_asian_width(ch) in "WFA" else 1
+            for ch in str(value)
+        )
+
+    def fit_cell(value, width):
+        value = str(value)
+        result = ""
+        current = 0
+
+        for ch in value:
+            cw = display_width(ch)
+            if current + cw > width:
+                break
+            result += ch
+            current += cw
+
+        return result + " " * max(0, width - current)
+
+    widths = [4, 14, 8, 8, 8]
+    headers = ["순위", "혈맹원", "출석", "가산점", "총점"]
+
+    lines = [
+        f"📊 **{period_name} 주간 점수**",
+        f"기간: `{start_date} 00:00 ~ {end_date} 현재`",
+        "```",
+        " | ".join(fit_cell(headers[i], widths[i]) for i in range(5)),
+        "-+-".join("-" * w for w in widths)
+    ]
+
+    for rank, row in enumerate(rows, start=1):
+        user_id, username, attendance_points, bonus_points, total_points = row
+        values = [
+            rank,
+            username,
+            int(attendance_points or 0),
+            int(bonus_points or 0),
+            int(total_points or 0)
+        ]
+        lines.append(
+            " | ".join(
+                fit_cell(values[i], widths[i])
+                for i in range(5)
+            )
+        )
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+async def weekly_score_command(ctx, weeks=1):
+    if not is_admin_channel(ctx):
+        return await ctx.send(
+            "❌ 관리자 전용방에서만 사용할 수 있습니다."
+        )
+
+    now = datetime.now(KST)
+    today = now.date()
+
+    # 이번 주 월요일 00:00을 기준으로 계산.
+    # !주간   = 이번 주 월요일 ~ 현재
+    # !2주간  = 저번 주 월요일 ~ 현재
+    # !3주간  = 저저번 주 월요일 ~ 현재
+    # !4주간  = 저저저번 주 월요일 ~ 현재
+    current_monday = today - timedelta(days=today.weekday())
+    start_date = current_monday - timedelta(days=(weeks - 1) * 7)
+
+    rows = await run_db(
+        load_weekly_scores,
+        start_date.isoformat(),
+        today.isoformat()
+    )
+
+    period_name = {
+        1: "이번 주",
+        2: "최근 2주",
+        3: "최근 3주",
+        4: "최근 4주"
+    }[weeks]
+
+    await ctx.send(
+        make_weekly_table(
+            rows,
+            period_name,
+            start_date.isoformat(),
+            today.isoformat()
+        )
+    )
+
+
+@bot.command(name="주간")
+async def weekly_command(ctx):
+    await weekly_score_command(ctx, 1)
+
+
+@bot.command(name="2주간")
+async def two_week_command(ctx):
+    await weekly_score_command(ctx, 2)
+
+
+@bot.command(name="3주간")
+async def three_week_command(ctx):
+    await weekly_score_command(ctx, 3)
+
+
+@bot.command(name="4주간")
+async def four_week_command(ctx):
+    await weekly_score_command(ctx, 4)
+
+
 @bot.command(name="득템초기화")
 async def drop_reset_command(ctx):
     if not is_admin_channel(ctx):
