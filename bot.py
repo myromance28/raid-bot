@@ -342,7 +342,7 @@ class DropManageView(discord.ui.View):
 class BonusGiveView(discord.ui.View):
 
     def __init__(self, attendance_view):
-        super().__init__(timeout=300)
+        super().__init__(timeout=60)
         self.attendance_view = attendance_view
 
     def selected_members(self):
@@ -352,27 +352,17 @@ class BonusGiveView(discord.ui.View):
         for key in attendance_state_cache.keys():
             d, s, n = key
 
-            if (
-                d == self.attendance_view.target_date
-                and s == self.attendance_view.target_slot
-            ):
+            if d == self.attendance_view.target_date and s == self.attendance_view.target_slot:
                 result.append(n)
 
         return result
 
     async def give(self, interaction, point):
 
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
         members = self.selected_members()
 
         if not members:
-            return await interaction.followup.send(
-                "❌ 선택된 인원 없음",
-                ephemeral=True
-            )
+            return await interaction.response.send_message("❌ 선택된 인원 없음", ephemeral=True)
 
         conn = get_db_connection()
 
@@ -382,8 +372,7 @@ class BonusGiveView(discord.ui.View):
                 for m in members:
 
                     cursor.execute("""
-                        INSERT INTO bonus_points
-                        (name, points, date, time_slot)
+                        INSERT INTO bonus_points(name, points, date, time_slot)
                         VALUES (%s, %s, %s, %s)
                     """, (
                         m,
@@ -394,7 +383,7 @@ class BonusGiveView(discord.ui.View):
 
                 conn.commit()
 
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"⭐ {len(members)}명에게 {point}점 지급 완료",
                 ephemeral=True
             )
@@ -403,24 +392,19 @@ class BonusGiveView(discord.ui.View):
             release_db_connection(conn)
 
     @discord.ui.button(label="1점", style=discord.ButtonStyle.secondary)
-    async def p1(self, i, b):
-        await self.give(i, 1)
+    async def p1(self, i, b): await self.give(i, 1)
 
     @discord.ui.button(label="2점", style=discord.ButtonStyle.secondary)
-    async def p2(self, i, b):
-        await self.give(i, 2)
+    async def p2(self, i, b): await self.give(i, 2)
 
     @discord.ui.button(label="3점", style=discord.ButtonStyle.primary)
-    async def p3(self, i, b):
-        await self.give(i, 3)
+    async def p3(self, i, b): await self.give(i, 3)
 
     @discord.ui.button(label="4점", style=discord.ButtonStyle.primary)
-    async def p4(self, i, b):
-        await self.give(i, 4)
+    async def p4(self, i, b): await self.give(i, 4)
 
     @discord.ui.button(label="5점", style=discord.ButtonStyle.success)
-    async def p5(self, i, b):
-        await self.give(i, 5)
+    async def p5(self, i, b): await self.give(i, 5)
 
 # =====================================================
 # 🔹 보스 득템 입력
@@ -1298,70 +1282,66 @@ async def 가산점(ctx):
         view=BonusMenuView()
     )
 
-@bot.command(name="가산점추가")
+
+# =====================================================
+# 🔥 데이터베이스 전체 초기화
+# =====================================================
+@bot.command(name="DB초기화")
 @commands.check(is_admin)
-async def bonus_add(ctx, name: str, points: int):
+async def db_reset(ctx):
+
+    global last_auto_panel_key
 
     conn = get_db_connection()
 
     try:
-        with conn.cursor() as cursor:
+        # 메모리 캐시 초기화
+        async with cache_lock:
+            attendance_add_cache.clear()
+            attendance_remove_cache.clear()
+            attendance_state_cache.clear()
 
-            now = datetime.now(KST)
+            # 자동 패널 중복 방지값 초기화
+            last_auto_panel_key = None
 
-            date = now.strftime("%Y-%m-%d")
-            slot = get_slot()
-
-            cursor.execute("""
-                INSERT INTO bonus_points
-                (name, points, date, time_slot)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                name,
-                points,
-                date,
-                slot
-            ))
-
-            conn.commit()
-
-        await ctx.send(
-            f"⭐ {name} +{points}점 지급 완료 ({date} {slot})"
-        )
-
-    finally:
-        release_db_connection(conn)
-
-# =====================================================
-# 🔹 가산점 전체 초기화
-# =====================================================
-@bot.command(name="가산점초기화")
-@commands.check(is_admin)
-async def bonus_reset(ctx, confirm: str = None):
-
-    if confirm != "확인":
-        return await ctx.send(
-            "⚠️ 가산점 전체 삭제는 아래처럼 입력하세요.\n\n"
-            "!가산점초기화 확인"
-        )
-
-    conn = get_db_connection()
-
-    try:
         with conn.cursor() as cursor:
 
             cursor.execute("""
-                DELETE FROM bonus_points
+                TRUNCATE TABLE
+                    attendance,
+                    members,
+                    drops,
+                    boss_list,
+                    bonus_points
+                RESTART IDENTITY
+                CASCADE
             """)
 
             conn.commit()
 
         await ctx.send(
-            "🗑️ 모든 가산점 기록이 초기화되었습니다."
+            "🧹 데이터베이스 전체 초기화 완료!\n\n"
+            "삭제된 데이터:\n"
+            "• 혈맹원 명단\n"
+            "• 출석 기록\n"
+            "• 보스 목록\n"
+            "• 득템 기록\n"
+            "• 가산점 기록\n\n"
+            "DB 테이블 구조는 유지되었습니다.\n"
+            "이제 혈맹원과 보스를 다시 등록하면 됩니다."
+        )
+
+    except Exception as e:
+
+        conn.rollback()
+
+        await ctx.send(
+            f"❌ DB 초기화 실패\n```{e}```"
         )
 
     finally:
         release_db_connection(conn)
+
 
 # =====================================================
 # 🔹 인원 추가
@@ -1596,7 +1576,7 @@ async def weekly_score(ctx):
 
         text = "\n".join([
             f"{name} : {attendance_map.get(name, 0)}점 "
-            f"(+{bonus_map.get(name, 0)}) = "
+            f"(가산점 +{bonus_map.get(name, 0)}) = "
             f"{attendance_map.get(name, 0) + bonus_map.get(name, 0)}점"
             for name in sorted(all_names)
         ])
@@ -1654,7 +1634,7 @@ async def monthly_score(ctx):
 
         text = "\n".join([
             f"{name} : {attendance_map.get(name, 0)}점 "
-            f"(+{bonus_map.get(name, 0)}) = "
+            f"(가산점 +{bonus_map.get(name, 0)}) = "
             f"{attendance_map.get(name, 0) + bonus_map.get(name, 0)}점"
             for name in sorted(all_names)
         ])
@@ -1707,7 +1687,7 @@ async def range_score(ctx, start_date: str, end_date: str):
 
         text = "\n".join([
             f"{name} : {attendance_map.get(name, 0)}점 "
-            f"(+{bonus_map.get(name, 0)}) = "
+            f"(가산점 +{bonus_map.get(name, 0)}) = "
             f"{attendance_map.get(name, 0) + bonus_map.get(name, 0)}점"
             for name in sorted(all_names)
         ])
