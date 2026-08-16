@@ -564,12 +564,23 @@ def save_boss_drop_db(boss_name, drop_name, user_id, username):
 
 async def send_boss_panel():
     global boss_panel_message_id
-    # 보스 버튼은 출석 비밀번호가 올라오는 관리자 채팅방에 표시한다.
-    # 일반 혈맹 출석채널의 출석 패널에는 보스 버튼을 넣지 않는다.
+
+    # 출석 비밀번호가 올라오는 관리자 채팅방에 표시
     admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
     if admin_channel is None:
+        print(f"[보스 패널 오류] 관리자 채널을 찾을 수 없습니다: {ADMIN_CHANNEL_ID}")
         return
 
+    # DB에 현재 등록된 전체 보스 목록을 다시 읽는다.
+    # 메모리 목록이 누락되었더라도 관리자방에는 DB 기준 전체 보스가 표시된다.
+    try:
+        current_bosses = await run_db(load_bosses)
+        boss_names[:] = current_bosses
+    except Exception as e:
+        print(f"[보스 목록 로드 오류] {type(e).__name__}: {e}")
+        current_bosses = list(boss_names)
+
+    # 기존 보스 패널 메시지가 있으면 갱신을 위해 삭제
     if boss_panel_message_id:
         try:
             old = await admin_channel.fetch_message(boss_panel_message_id)
@@ -578,15 +589,21 @@ async def send_boss_panel():
             pass
         boss_panel_message_id = None
 
-    if not boss_names:
+    # 등록된 보스가 하나도 없으면 패널을 만들지 않는다.
+    if not current_bosses:
         return
+
+    # 현재 등록된 '전체' 보스를 빨간 버튼으로 생성
+    view = BossPanelView()
 
     msg = await admin_channel.send(
         "👹 **보스 목록**\n"
-        "아래 빨간색 버튼을 눌러 득템 이름을 입력하세요.",
-        view=BossPanelView()
+        "현재 등록된 보스입니다.\n"
+        "보스를 처치한 후 해당 보스의 빨간 버튼을 눌러 득템 이름을 입력하세요.",
+        view=view
     )
     boss_panel_message_id = msg.id
+
 
 
 class BossDropModal(discord.ui.Modal, title="🎁 득템 이름 입력"):
@@ -1475,39 +1492,60 @@ async def bonus_command(ctx):
 async def boss_add(ctx, *, boss_name: str = ""):
     if not is_admin_channel(ctx):
         return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+
     name = " ".join(boss_name.split()).strip()
     if not name:
         return await ctx.send("❌ 사용법: `!보스추가 이프리트`")
+
     try:
         inserted = await run_db(add_boss_db, name)
+
         if not inserted:
-            return await ctx.send(f"⚠️ **{name}**은 이미 등록되어 있습니다.")
-        if name not in boss_names:
-            boss_names.append(name)
-        await ctx.send(f"🔴 **{name}** 보스가 추가되었습니다.")
+            return await ctx.send(
+                f"⚠️ **{name}**은 이미 등록되어 있습니다."
+            )
+
+        # DB에 추가된 뒤 현재 등록된 모든 보스 목록으로
+        # 관리자방 패널을 다시 생성한다.
+        await ctx.send(f"🔴 **{name}** 보스가 등록되었습니다.")
         await send_boss_panel()
+
     except Exception as e:
         print(f"[보스추가 오류] {type(e).__name__}: {e}")
-        await ctx.send(f"❌ 보스 추가 중 DB 오류가 발생했습니다.\n```{e}```")
+        await ctx.send(
+            "❌ 보스 추가 중 DB 오류가 발생했습니다.\n"
+            f"```{e}```"
+        )
+
 
 
 @bot.command(name="보스삭제", aliases=["보스 삭제"])
 async def boss_delete(ctx, *, boss_name: str = ""):
     if not is_admin_channel(ctx):
         return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+
     name = " ".join(boss_name.split()).strip()
     if not name:
         return await ctx.send("❌ 사용법: `!보스삭제 이프리트`")
+
     try:
         deleted = await run_db(delete_boss_db, name)
+
         if not deleted:
-            return await ctx.send(f"❌ **{name}** 보스를 찾을 수 없습니다.")
-        boss_names[:] = [x for x in boss_names if x != name]
+            return await ctx.send(
+                f"❌ **{name}** 보스를 찾을 수 없습니다."
+            )
+
         await ctx.send(f"🗑️ **{name}** 보스가 삭제되었습니다.")
         await send_boss_panel()
+
     except Exception as e:
         print(f"[보스삭제 오류] {type(e).__name__}: {e}")
-        await ctx.send(f"❌ 보스 삭제 중 DB 오류가 발생했습니다.\n```{e}```")
+        await ctx.send(
+            "❌ 보스 삭제 중 DB 오류가 발생했습니다.\n"
+            f"```{e}```"
+        )
+
 
 
 @bot.command(name="DB초기화")
