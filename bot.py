@@ -606,6 +606,170 @@ async def send_boss_panel():
 
 
 
+
+class DropDeleteSelect(discord.ui.Select):
+    def __init__(self, drops):
+        self.drops = drops
+
+        options = []
+        for row in drops[:25]:
+            drop_id, boss_name, drop_name, username, created_at = row
+            label = f"{boss_name} - {drop_name}"[:100]
+            desc = f"{username} / {created_at.strftime('%m-%d %H:%M') if created_at else ''}"[:100]
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=desc,
+                    value=str(drop_id)
+                )
+            )
+
+        super().__init__(
+            placeholder="삭제할 득템 내역을 선택하세요.",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin_channel(interaction):
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        drop_id = int(self.values[0])
+        try:
+            deleted = await run_db(delete_drop_db, drop_id)
+            if deleted:
+                await interaction.response.send_message(
+                    "🗑️ 선택한 득템 내역을 삭제했습니다.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ 해당 득템 내역을 찾을 수 없습니다.",
+                    ephemeral=True
+                )
+        except Exception as e:
+            print(f"[득템 삭제 오류] {type(e).__name__}: {e}")
+            await interaction.response.send_message(
+                f"❌ 득템 삭제 중 오류가 발생했습니다.\n```{e}```",
+                ephemeral=True
+            )
+
+
+class DropListView(discord.ui.View):
+    def __init__(self, drops):
+        super().__init__(timeout=300)
+        if drops:
+            self.add_item(DropDeleteSelect(drops))
+
+
+def load_all_drops():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, boss_name, drop_name, username, created_at
+                FROM boss_drops
+                ORDER BY created_at DESC, id DESC
+            """)
+            return cursor.fetchall()
+    finally:
+        release_db_connection(conn)
+
+
+def delete_drop_db(drop_id):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM boss_drops WHERE id=%s",
+                (drop_id,)
+            )
+            deleted = cursor.rowcount > 0
+        conn.commit()
+        return deleted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def reset_all_drops_db():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM boss_drops")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+class DropResetConfirmModal(discord.ui.Modal, title="⚠️ 득템 전체 초기화"):
+    confirm_text = discord.ui.TextInput(
+        label='확인 문구: "동의합니다"',
+        placeholder="동의합니다",
+        required=True,
+        min_length=5,
+        max_length=10
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin_channel(interaction):
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        if str(self.confirm_text.value).strip() != "동의합니다":
+            return await interaction.response.send_message(
+                '❌ 확인 문구가 일치하지 않습니다.\n'
+                '정확히 **동의합니다**라고 입력해야 초기화됩니다.',
+                ephemeral=True
+            )
+
+        try:
+            await run_db(reset_all_drops_db)
+            await interaction.response.send_message(
+                "✅ **득템 목록 전체 초기화 완료**\n"
+                "등록되어 있던 모든 득템 내역이 삭제되었습니다.",
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"[득템 전체 초기화 오류] {type(e).__name__}: {e}")
+            await interaction.response.send_message(
+                f"❌ 득템 초기화 중 오류가 발생했습니다.\n```{e}```",
+                ephemeral=True
+            )
+
+
+class DropResetView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.Button(
+        label="⚠️ 득템 전체 초기화",
+        style=discord.ButtonStyle.danger
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not is_admin_channel(interaction):
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+        await interaction.response.send_modal(DropResetConfirmModal())
+
+
 class BossDropModal(discord.ui.Modal, title="🎁 득템 이름 입력"):
     drop_name = discord.ui.TextInput(
         label="득템 이름",
@@ -1550,6 +1714,78 @@ async def boss_delete(ctx, *, boss_name: str = ""):
             f"```{e}```"
         )
 
+
+
+@bot.command(name="득템")
+async def drop_list_command(ctx):
+    if not is_admin_channel(ctx):
+        return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+
+    try:
+        drops = await run_db(load_all_drops)
+
+        if not drops:
+            return await ctx.send(
+                "🎁 **전체 득템 내역**\n\n"
+                "현재 등록된 득템 내역이 없습니다."
+            )
+
+        # 한 줄에 하나의 득템 기록을 가로 형태로 표시
+        # 예: 피닉스 - 깃털 - 홍길동 - 01:25
+        lines = ["🎁 **전체 득템 내역**", "```"]
+
+        for drop_id, boss_name, drop_name, username, created_at in drops:
+            time_text = (
+                created_at.strftime("%m-%d %H:%M")
+                if created_at else "시간 없음"
+            )
+            lines.append(
+                f"{boss_name} - {drop_name} - {username} - {time_text}"
+            )
+
+        lines.append("```")
+
+        # Discord 메시지 길이 제한 대응
+        chunks = []
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > 1900:
+                chunks.append(current)
+                current = ""
+            current += line + "\n"
+
+        if current.strip():
+            chunks.append(current)
+
+        for index, chunk in enumerate(chunks):
+            if index == len(chunks) - 1:
+                await ctx.send(
+                    chunk,
+                    view=DropListView(drops)
+                )
+            else:
+                await ctx.send(chunk)
+
+    except Exception as e:
+        print(f"[득템 조회 오류] {type(e).__name__}: {e}")
+        await ctx.send(
+            f"❌ 득템 내역 조회 중 오류가 발생했습니다.\n```{e}```"
+        )
+
+
+@bot.command(name="득템초기화")
+async def drop_reset_command(ctx):
+    if not is_admin_channel(ctx):
+        return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+
+    await ctx.send(
+        "⚠️ **득템 목록 전체 초기화 경고** ⚠️\n\n"
+        "이 작업을 진행하면 현재 DB에 등록된 **모든 득템 내역이 삭제됩니다.**\n"
+        "삭제된 득템 내역은 복구할 수 없습니다.\n\n"
+        "정말 초기화하려면 아래 버튼을 누르고\n"
+        '**"동의합니다"**를 입력하세요.',
+        view=DropResetView()
+    )
 
 
 @bot.command(name="DB초기화")
