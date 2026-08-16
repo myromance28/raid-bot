@@ -753,7 +753,7 @@ class DropResetView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
 
-    @discord.ui.Button(
+    @discord.ui.button(
         label="⚠️ 득템 전체 초기화",
         style=discord.ButtonStyle.danger
     )
