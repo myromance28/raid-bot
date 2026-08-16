@@ -67,6 +67,11 @@ def release_db_connection(conn):
         pass
 
 
+async def run_db(func, *args):
+    """동기 psycopg2 작업을 별도 스레드에서 실행해 Discord 이벤트 루프를 막지 않음."""
+    return await asyncio.to_thread(func, *args)
+
+
 # =====================================================
 # 🔹 Flask KeepAlive
 # =====================================================
@@ -343,103 +348,128 @@ class AttendancePasswordModal(
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-
         global current_password
         global current_date
         global current_slot
 
         if interaction.channel_id != ATTENDANCE_CHANNEL_ID:
             return await interaction.response.send_message(
-                "❌ 일반 혈맹 출석창에서만 출석할 수 있습니다.",
+                "❌ 일반 출석창에서만 출석할 수 있습니다.",
                 ephemeral=True
             )
 
-        now = datetime.now(KST)
+        # Discord의 응답 제한시간을 먼저 확보한다.
+        # 이후 PostgreSQL 작업이 조금 늦어져도
+        # "뭔가 잘못되었어요"가 발생하지 않도록 한다.
+        await interaction.response.defer(ephemeral=True)
 
-        # 패널 시간 이후 3시간 동안만 유효
-        if current_password is None:
-            return await interaction.response.send_message(
-                "❌ 현재 출석 가능한 시간이 아닙니다.",
-                ephemeral=True
-            )
-
-        # 현재 세션의 날짜/시간대 확인
-        expected_date = now.strftime("%Y-%m-%d")
-
-        if current_date != expected_date:
-            return await interaction.response.send_message(
-                "❌ 현재 출석 세션이 종료되었습니다.",
-                ephemeral=True
-            )
-
-        # 테스트 모드에서는 각 분의 세션을 1분 동안만 유효하게 한다.
-        # 운영 모드에서는 기존처럼 생성 시각 기준 3시간 동안 유효하다.
         try:
-            if TEST_MODE:
-                session_hour = int(current_slot[:2])
-                session_minute = int(current_slot[2:4])
-            else:
-                session_hour = int(current_slot)
-                session_minute = 0
-        except Exception:
-            return await interaction.response.send_message(
-                "❌ 출석 세션 정보를 확인할 수 없습니다.",
+            now = datetime.now(KST)
+
+            if current_password is None:
+                return await interaction.followup.send(
+                    "❌ 현재 출석 가능한 시간이 아닙니다.",
+                    ephemeral=True
+                )
+
+            expected_date = now.strftime("%Y-%m-%d")
+
+            if current_date != expected_date:
+                return await interaction.followup.send(
+                    "❌ 현재 출석 세션이 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            try:
+                if TEST_MODE:
+                    session_hour = int(current_slot[:2])
+                    session_minute = int(current_slot[2:4])
+                else:
+                    session_hour = int(current_slot)
+                    session_minute = 0
+            except Exception:
+                return await interaction.followup.send(
+                    "❌ 출석 세션 정보를 확인할 수 없습니다.",
+                    ephemeral=True
+                )
+
+            session_start = now.replace(
+                hour=session_hour,
+                minute=session_minute,
+                second=0,
+                microsecond=0
+            )
+
+            session_duration = (
+                timedelta(minutes=1)
+                if TEST_MODE
+                else timedelta(hours=3)
+            )
+
+            if now < session_start or now >= session_start + session_duration:
+                return await interaction.followup.send(
+                    "❌ 출석 가능 시간이 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            entered = str(self.password_input.value).strip()
+
+            if entered != current_password:
+                return await interaction.followup.send(
+                    "❌ 비밀번호가 틀렸습니다.",
+                    ephemeral=True
+                )
+
+            user_id = interaction.user.id
+            username = interaction.user.display_name
+
+            # DB 작업은 별도 스레드에서 실행하여 Discord 이벤트 루프를 막지 않는다.
+            already_attended = await run_db(
+                has_attendance,
+                current_date,
+                current_slot,
+                user_id
+            )
+
+            if already_attended:
+                return await interaction.followup.send(
+                    "⚠️ 이미 이번 출석에 참여하셨습니다.",
+                    ephemeral=True
+                )
+
+            inserted = await run_db(
+                save_attendance,
+                current_date,
+                current_slot,
+                user_id,
+                username
+            )
+
+            if not inserted:
+                return await interaction.followup.send(
+                    "⚠️ 이미 이번 출석에 참여하셨습니다.",
+                    ephemeral=True
+                )
+
+            await interaction.followup.send(
+                f"✅ 출석 완료!\n"
+                f"👤 {username}\n"
+                f"⭐ 1점이 지급되었습니다.",
                 ephemeral=True
             )
 
-        session_start = now.replace(
-            hour=session_hour,
-            minute=session_minute,
-            second=0,
-            microsecond=0
-        )
+        except Exception as e:
+            print(f"[출석 처리 오류] {type(e).__name__}: {e}")
 
-        session_duration = timedelta(minutes=1) if TEST_MODE else timedelta(hours=3)
+            try:
+                await interaction.followup.send(
+                    "❌ 출석 처리 중 오류가 발생했습니다.\n"
+                    "잠시 후 다시 시도해주세요.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
 
-        if now < session_start or now >= session_start + session_duration:
-            return await interaction.response.send_message(
-                "❌ 출석 가능 시간이 종료되었습니다.",
-                ephemeral=True
-            )
-
-        entered = str(self.password_input.value).strip()
-
-        if entered != current_password:
-            return await interaction.response.send_message(
-                "❌ 비밀번호가 틀렸습니다.",
-                ephemeral=True
-            )
-
-        user_id = interaction.user.id
-
-        # 같은 세션에 한 번만 출석 가능
-        if has_attendance(current_date, current_slot, user_id):
-            return await interaction.response.send_message(
-                "⚠️ 이미 이번 출석에 참여하셨습니다.",
-                ephemeral=True
-            )
-
-        username = interaction.user.display_name
-
-        inserted = save_attendance(
-            current_date,
-            current_slot,
-            user_id,
-            username
-        )
-
-        if not inserted:
-            return await interaction.response.send_message(
-                "⚠️ 이미 이번 출석에 참여하셨습니다.",
-                ephemeral=True
-            )
-
-        await interaction.response.send_message(
-            f"✅ 출석 완료!\n"
-            f"👤 {username}\n"
-            f"⭐ 1점이 지급되었습니다.",
-            ephemeral=True
-        )
 
 
 # =====================================================
@@ -651,9 +681,97 @@ bot.add_view(AttendanceView())
 # =====================================================
 # 🔹 관리자 전용 명령어
 # =====================================================
+class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 확인"):
+    confirm_input = discord.ui.TextInput(
+        label="초기화 동의 문구",
+        placeholder="아래 문구를 정확하게 입력하세요: 초기화 동의",
+        min_length=6,
+        max_length=20,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.channel_id != ADMIN_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 초기화할 수 있습니다.",
+                ephemeral=True
+            )
+
+        entered = str(self.confirm_input.value).strip()
+
+        if entered != "초기화 동의":
+            return await interaction.response.send_message(
+                "❌ 확인 문구가 일치하지 않습니다.\n"
+                "DB 초기화가 취소되었습니다.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        conn = None
+
+        try:
+            conn = await run_db(get_db_connection)
+
+            def reset_database(connection):
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "TRUNCATE TABLE attendance_v2 "
+                            "RESTART IDENTITY CASCADE"
+                        )
+
+                        cursor.execute(
+                            "TRUNCATE TABLE attendance_sessions "
+                            "RESTART IDENTITY CASCADE"
+                        )
+
+                        connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    release_db_connection(connection)
+
+            await run_db(reset_database, conn)
+            conn = None
+
+            global current_password
+            global current_date
+            global current_slot
+            global last_panel_key
+
+            current_password = None
+            current_date = None
+            current_slot = None
+            last_panel_key = None
+
+            await interaction.followup.send(
+                "🧹 **DB 전체 초기화 완료**\n\n"
+                "• 모든 출석 기록 삭제\n"
+                "• 출석 비밀번호 세션 초기화\n"
+                "• 현재 출석 세션 초기화 완료\n\n"
+                "이제 Discord ID 기준으로 출석 기록을 새로 저장합니다.",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            if conn is not None:
+                try:
+                    await run_db(release_db_connection, conn)
+                except Exception:
+                    pass
+
+            print(f"[DB 초기화 오류] {type(e).__name__}: {e}")
+
+            await interaction.followup.send(
+                f"❌ **DB 초기화 실패**\n```{e}```",
+                ephemeral=True
+            )
+
+
 @bot.command(name="DB초기화")
 async def db_reset(ctx):
-    # 관리자 전용방에서만 실행
     if not is_admin_channel(ctx):
         return await ctx.send(
             "❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다."
@@ -667,70 +785,34 @@ async def db_reset(ctx):
         "• 모든 출석 기록\n"
         "• 출석 비밀번호 세션\n\n"
         "⚠️ **초기화 후에는 데이터를 복구할 수 없습니다.**\n\n"
-        "초기화를 진행하려면 아래 문구를 **정확하게 입력하세요.**\n\n"
-        "```초기화 동의```\n\n"
-        "⏰ 30초 이내에 입력해야 합니다."
+        "아래 **확인 버튼**을 눌러 초기화 확인창을 열어주세요.",
+        view=DBResetConfirmView()
     )
 
-    def check(message):
-        return (
-            message.author.id == ctx.author.id
-            and message.channel.id == ctx.channel.id
-            and message.content.strip() == "초기화 동의"
-        )
 
-    try:
-        await bot.wait_for("message", timeout=30.0, check=check)
-    except asyncio.TimeoutError:
-        return await ctx.send(
-            "⌛ **DB 초기화가 취소되었습니다.**\n"
-            "30초 안에 `초기화 동의`가 입력되지 않았습니다."
-        )
+class DBResetConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
 
-    conn = get_db_connection()
-
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "TRUNCATE TABLE attendance_v2 "
-                "RESTART IDENTITY CASCADE"
+    @discord.ui.button(
+        label="⚠️ 초기화 진행",
+        style=discord.ButtonStyle.danger,
+        custom_id="raid_db_reset_confirm_button"
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.channel_id != ADMIN_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 초기화할 수 있습니다.",
+                ephemeral=True
             )
 
-            cursor.execute(
-                "TRUNCATE TABLE attendance_sessions "
-                "RESTART IDENTITY CASCADE"
-            )
+        await interaction.response.send_modal(DBResetConfirmModal())
 
-            conn.commit()
 
-        global current_password
-        global current_date
-        global current_slot
-        global last_panel_key
-
-        current_password = None
-        current_date = None
-        current_slot = None
-        last_panel_key = None
-
-        await ctx.send(
-            "🧹 **DB 전체 초기화 완료**\n\n"
-            "• 모든 출석 기록 삭제\n"
-            "• 출석 비밀번호 세션 초기화\n"
-            "• 현재 출석 세션 초기화 완료\n\n"
-            "이제 Discord ID 기준으로 "
-            "출석 기록을 새로 저장합니다."
-        )
-
-    except Exception as e:
-        conn.rollback()
-
-        await ctx.send(
-            f"❌ **DB 초기화 실패**\n```{e}```"
-        )
-
-    finally:
-        release_db_connection(conn)
 
 
 
