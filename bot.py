@@ -103,6 +103,16 @@ current_date = None
 current_slot = None
 last_panel_key = None
 
+# =====================================================
+# 🔹 현재 가산점 세션
+# =====================================================
+bonus_password = None
+bonus_date = None
+bonus_slot = None
+bonus_points = None
+bonus_created_at = None
+bonus_message_ids = set()
+
 
 def get_current_slot(hour=None):
     if hour is None:
@@ -164,6 +174,33 @@ def init_database():
                     password TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (date, time_slot)
+                )
+            """)
+
+            # 가산점 세션
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bonus_sessions (
+                    id SERIAL PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    time_slot TEXT NOT NULL,
+                    points INTEGER NOT NULL,
+                    password TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date, time_slot)
+                )
+            """)
+
+            # 가산점 출석 기록
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bonus_attendance (
+                    id SERIAL PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    time_slot TEXT NOT NULL,
+                    points INTEGER NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date, time_slot, user_id)
                 )
             """)
 
@@ -323,12 +360,372 @@ def save_attendance(date, slot, user_id, username):
 
 
 # =====================================================
+# 🔹 가산점 DB 함수
+# =====================================================
+def save_bonus_session(date_text, slot_text, points, password):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO bonus_sessions
+                    (date, time_slot, points, password)
+                VALUES
+                    (%s, %s, %s, %s)
+                ON CONFLICT (date, time_slot)
+                DO UPDATE SET
+                    points = EXCLUDED.points,
+                    password = EXCLUDED.password,
+                    created_at = CURRENT_TIMESTAMP
+            """, (
+                date_text,
+                slot_text,
+                points,
+                password
+            ))
+
+            conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        release_db_connection(conn)
+
+
+def has_bonus_attendance(date_text, slot_text, user_id):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 1
+                FROM bonus_attendance
+                WHERE date=%s
+                  AND time_slot=%s
+                  AND user_id=%s
+                LIMIT 1
+            """, (
+                date_text,
+                slot_text,
+                user_id
+            ))
+
+            return cursor.fetchone() is not None
+
+    finally:
+        release_db_connection(conn)
+
+
+def save_bonus_attendance(
+    date_text,
+    slot_text,
+    points,
+    user_id,
+    username
+):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO bonus_attendance
+                    (date, time_slot, points, user_id, username)
+                VALUES
+                    (%s, %s, %s, %s, %s)
+                ON CONFLICT (date, time_slot, user_id)
+                DO NOTHING
+            """, (
+                date_text,
+                slot_text,
+                points,
+                user_id,
+                username
+            ))
+
+            inserted = cursor.rowcount > 0
+            conn.commit()
+
+            return inserted
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        release_db_connection(conn)
+
+
+def delete_bonus_session(date_text, slot_text):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM bonus_sessions
+                WHERE date=%s AND time_slot=%s
+            """, (date_text, slot_text))
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        release_db_connection(conn)
+
+
+# =====================================================
 # 🔹 출석 패널
 # =====================================================
+class BonusPasswordModal(
+    discord.ui.Modal,
+    title="🔵 가산점 비밀번호"
+):
+    password_input = discord.ui.TextInput(
+        label="4자리 가산점 비밀번호",
+        placeholder="관리자 전용방에 표시된 번호를 입력하세요.",
+        min_length=4,
+        max_length=4,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        global bonus_password
+        global bonus_date
+        global bonus_slot
+        global bonus_points
+        global bonus_created_at
+
+        if interaction.channel_id != ATTENDANCE_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ 일반 혈맹 출석창에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            if (
+                bonus_password is None
+                or bonus_date is None
+                or bonus_slot is None
+                or bonus_points is None
+                or bonus_created_at is None
+            ):
+                return await interaction.followup.send(
+                    "❌ 현재 활성화된 가산점이 없습니다.",
+                    ephemeral=True
+                )
+
+            now = datetime.now(KST)
+
+            # 가산점은 생성 시점부터 정확히 1시간 유효
+            if now >= bonus_created_at + timedelta(hours=1):
+                bonus_password = None
+                bonus_date = None
+                bonus_slot = None
+                bonus_points = None
+                bonus_created_at = None
+
+                return await interaction.followup.send(
+                    "❌ 가산점 유효시간이 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            entered = str(self.password_input.value).strip()
+
+            if entered != bonus_password:
+                return await interaction.followup.send(
+                    "❌ 가산점 비밀번호가 틀렸습니다.",
+                    ephemeral=True
+                )
+
+            user_id = interaction.user.id
+            username = interaction.user.display_name
+
+            already = await run_db(
+                has_bonus_attendance,
+                bonus_date,
+                bonus_slot,
+                user_id
+            )
+
+            if already:
+                return await interaction.followup.send(
+                    "⚠️ 이미 이번 가산점을 받으셨습니다.",
+                    ephemeral=True
+                )
+
+            inserted = await run_db(
+                save_bonus_attendance,
+                bonus_date,
+                bonus_slot,
+                bonus_points,
+                user_id,
+                username
+            )
+
+            if not inserted:
+                return await interaction.followup.send(
+                    "⚠️ 이미 이번 가산점을 받으셨습니다.",
+                    ephemeral=True
+                )
+
+            await interaction.followup.send(
+                f"🔵 **가산점 +{bonus_points}점 지급 완료!**\n"
+                f"👤 {username}\n"
+                f"⭐ +{bonus_points}점",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            print(
+                f"[가산점 처리 오류] "
+                f"{type(e).__name__}: {e}"
+            )
+
+            try:
+                await interaction.followup.send(
+                    "❌ 가산점 처리 중 오류가 발생했습니다.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+
+
+class BonusButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="🔵 가산점",
+            style=discord.ButtonStyle.primary,
+            custom_id="raid_bonus_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if (
+            bonus_password is None
+            or bonus_date is None
+            or bonus_slot is None
+            or bonus_points is None
+        ):
+            return await interaction.response.send_message(
+                "❌ 현재 활성화된 가산점이 없습니다.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_modal(
+            BonusPasswordModal()
+        )
+
+
+class BonusPointButton(discord.ui.Button):
+    def __init__(self, points):
+        super().__init__(
+            label=f"{points}점",
+            style=discord.ButtonStyle.primary
+        )
+        self.points = points
+
+    async def callback(self, interaction: discord.Interaction):
+        global bonus_password
+        global bonus_date
+        global bonus_slot
+        global bonus_points
+        global bonus_created_at
+
+        if not is_admin_channel(interaction):
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        # 한 번 생성된 가산점 세션이 아직 1시간 안에 있다면
+        # 새 가산점을 덮어쓰지 않도록 한다.
+        if (
+            bonus_password is not None
+            and bonus_created_at is not None
+            and datetime.now(KST) < bonus_created_at + timedelta(hours=1)
+        ):
+            return await interaction.response.send_message(
+                f"⚠️ 현재 **+{bonus_points}점 가산점**이 이미 활성화되어 있습니다.\n"
+                "기존 가산점이 종료된 후 새 가산점을 생성해주세요.",
+                ephemeral=True
+            )
+
+        now = datetime.now(KST)
+        date_text = now.strftime("%Y-%m-%d")
+
+        # 테스트 모드에서도 명령어를 누른 시각을 세션 키로 사용
+        if TEST_MODE:
+            slot_text = now.strftime("%H%M%S")
+        else:
+            slot_text = now.strftime("%H%M")
+
+        password = generate_password()
+
+        try:
+            await run_db(
+                save_bonus_session,
+                date_text,
+                slot_text,
+                self.points,
+                password
+            )
+
+            bonus_password = password
+            bonus_date = date_text
+            bonus_slot = slot_text
+            bonus_points = self.points
+            bonus_created_at = now
+
+            await interaction.response.send_message(
+                f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
+                f"🔐 가산점 비밀번호\n"
+                f"```{password}```\n\n"
+                f"⏰ 유효시간: 1시간\n"
+                f"👥 지금부터 생성되는 출석 패널에 "
+                f"일반 출석창 **🔵 가산점** 버튼이 표시됩니다.",
+                ephemeral=False
+            )
+
+        except Exception as e:
+            print(
+                f"[가산점 생성 오류] "
+                f"{type(e).__name__}: {e}"
+            )
+
+            await interaction.response.send_message(
+                "❌ 가산점 생성 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+class BonusPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+        for points in range(1, 6):
+            self.add_item(BonusPointButton(points))
+
+
 class AttendanceView(discord.ui.View):
 
     def __init__(self):
         super().__init__(timeout=None)
+
+        # 자동 출석 패널에서는 가산점 세션이 활성화된 경우에만
+        # 파란색 가산점 버튼을 추가한다.
+        # 가산점 세션은 !가산점 명령어로만 생성된다.
+        if (
+            bonus_password is not None
+            and bonus_date is not None
+            and bonus_slot is not None
+            and bonus_points is not None
+        ):
+            self.add_item(BonusButton())
 
     @discord.ui.button(
         label="✅ 출석하기",
@@ -620,6 +1017,9 @@ async def automatic_attendance_panel():
         # 일반 출석창
         validity_text = "1분" if TEST_MODE else "3시간"
 
+        # 여기서는 출석 패널만 생성한다.
+        # 가산점은 !가산점 명령어로 생성된 활성 세션이 있을 때만
+        # AttendanceView에 파란색 버튼으로 표시된다.
         await attendance_channel.send(
             f"📢 **출석 시간입니다!**\n"
             f"🕒 {now.strftime('%H:%M:%S')} 출석\n\n"
@@ -659,8 +1059,43 @@ async def automatic_channel_cleanup():
     now = datetime.now(KST)
 
     if TEST_MODE:
-        # 테스트 모드에서는 automatic_attendance_panel이
-        # 새 패널 생성 직전에 이전 메시지를 삭제하므로 여기서는 아무것도 하지 않는다.
+        # 출석 패널은 1분마다 automatic_attendance_panel이 교체한다.
+        # 가산점은 별도 생성이므로 생성 후 1시간 동안 유지한다.
+        global bonus_password
+        global bonus_date
+        global bonus_slot
+        global bonus_points
+        global bonus_created_at
+
+        if (
+            bonus_password is not None
+            and bonus_created_at is not None
+            and now >= bonus_created_at + timedelta(hours=1)
+        ):
+            old_date = bonus_date
+            old_slot = bonus_slot
+
+            bonus_password = None
+            bonus_date = None
+            bonus_slot = None
+            bonus_points = None
+            bonus_created_at = None
+
+            if old_date and old_slot:
+                try:
+                    await run_db(
+                        delete_bonus_session,
+                        old_date,
+                        old_slot
+                    )
+                except Exception as e:
+                    print(f"[가산점 DB 정리 오류] {e}")
+
+            print(
+                "[가산점 종료] 1시간이 지나 "
+                "가산점 세션을 종료했습니다."
+            )
+
         return
 
     # 운영 모드:
@@ -747,6 +1182,11 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
                             "RESTART IDENTITY CASCADE"
                         )
 
+                        cursor.execute(
+                            "TRUNCATE TABLE bonus_attendance, bonus_sessions "
+                            "RESTART IDENTITY CASCADE"
+                        )
+
                         connection.commit()
                 except Exception:
                     connection.rollback()
@@ -761,11 +1201,22 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             global current_date
             global current_slot
             global last_panel_key
+            global bonus_password
+            global bonus_date
+            global bonus_slot
+            global bonus_points
+            global bonus_created_at
 
             current_password = None
             current_date = None
             current_slot = None
             last_panel_key = None
+
+            bonus_password = None
+            bonus_date = None
+            bonus_slot = None
+            bonus_points = None
+            bonus_created_at = None
 
             await interaction.followup.send(
                 "🧹 **DB 전체 초기화 완료**\n\n"
@@ -791,6 +1242,25 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             )
 
 
+@bot.command(name="가산점")
+async def bonus_command(ctx):
+    # 가산점은 이 명령어를 입력했을 때만 생성/표시된다.
+    # 자동 출석 루프에서는 가산점 세션을 절대 생성하지 않는다.
+    if not is_admin_channel(ctx):
+        return await ctx.send(
+            "❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다."
+        )
+
+    await ctx.send(
+        "🔵 **가산점 패널**\n\n"
+        "부여할 가산점을 선택하세요.\n"
+        "아래 1~5점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
+        "⚠️ 가산점은 이 명령어를 실행하기 전에는 "
+        "일반 출석창에 나타나지 않습니다.",
+        view=BonusPanelView()
+    )
+
+
 @bot.command(name="DB초기화")
 async def db_reset(ctx):
     if not is_admin_channel(ctx):
@@ -804,7 +1274,8 @@ async def db_reset(ctx):
         "이 작업을 진행하면 현재 저장된 **모든 출석 정보가 초기화됩니다.**\n\n"
         "삭제되는 정보:\n"
         "• 모든 출석 기록\n"
-        "• 출석 비밀번호 세션\n\n"
+        "• 출석 비밀번호 세션\n"
+        "• 가산점 기록 및 세션\n\n"
         "⚠️ **초기화 후에는 데이터를 복구할 수 없습니다.**\n\n"
         "아래 **확인 버튼**을 눌러 초기화 확인창을 열어주세요.",
         view=DBResetConfirmView()
@@ -877,6 +1348,7 @@ async def on_ready():
         f"테스트모드: {TEST_MODE}, "
         f"출석패널 주기: {TEST_INTERVAL_MINUTES}분"
     )
+    print("가산점 기능: !가산점 / 1~5점 / 유효시간 1시간")
 
 
 # =====================================================
