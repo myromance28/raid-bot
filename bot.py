@@ -1843,6 +1843,46 @@ async def drop_list_command(ctx):
         await ctx.send(f"❌ 득템 내역 조회 중 오류가 발생했습니다.\n```{e}```")
 
 
+
+def load_weekly_scores(start_date, end_date):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    user_id,
+                    MAX(username) AS username,
+                    SUM(attendance_points) AS attendance_points,
+                    SUM(bonus_points) AS bonus_points,
+                    SUM(attendance_points + bonus_points) AS total_points
+                FROM (
+                    SELECT user_id, username,
+                           COALESCE(SUM(points), 0) AS attendance_points,
+                           0::BIGINT AS bonus_points
+                    FROM attendance_v2
+                    WHERE date >= %s AND date <= %s
+                    GROUP BY user_id, username
+
+                    UNION ALL
+
+                    SELECT user_id, username,
+                           0::BIGINT AS attendance_points,
+                           COALESCE(SUM(points), 0) AS bonus_points
+                    FROM bonus_attendance
+                    WHERE date >= %s AND date <= %s
+                    GROUP BY user_id, username
+                ) AS score_data
+                GROUP BY user_id
+                ORDER BY total_points DESC,
+                         attendance_points DESC,
+                         bonus_points DESC,
+                         user_id ASC
+            """, (start_date, end_date, start_date, end_date))
+            return cursor.fetchall()
+    finally:
+        release_db_connection(conn)
+
+
 def make_weekly_page(rows, period_name, start_date, end_date, page, page_size=50):
     total_pages=max(1,(len(rows)+page_size-1)//page_size)
     page=max(0,min(page,total_pages-1))
@@ -1965,6 +2005,238 @@ async def weekly_score_command(ctx,weeks=1):
             ctx,rows,period_name,
             start_date.isoformat(),today.isoformat(),page
         )
+    )
+
+
+
+def load_period_scores(start_date, end_date):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    user_id,
+                    MAX(username) AS username,
+                    SUM(attendance_points) AS attendance_points,
+                    SUM(bonus_points) AS bonus_points,
+                    SUM(attendance_points + bonus_points) AS total_points
+                FROM (
+                    SELECT user_id, username,
+                           COALESCE(SUM(points), 0) AS attendance_points,
+                           0::BIGINT AS bonus_points
+                    FROM attendance_v2
+                    WHERE date >= %s AND date <= %s
+                    GROUP BY user_id, username
+
+                    UNION ALL
+
+                    SELECT user_id, username,
+                           0::BIGINT AS attendance_points,
+                           COALESCE(SUM(points), 0) AS bonus_points
+                    FROM bonus_attendance
+                    WHERE date >= %s AND date <= %s
+                    GROUP BY user_id, username
+                ) AS score_data
+                GROUP BY user_id
+                ORDER BY total_points DESC,
+                         attendance_points DESC,
+                         bonus_points DESC,
+                         user_id ASC
+            """, (start_date, end_date, start_date, end_date))
+            return cursor.fetchall()
+    finally:
+        release_db_connection(conn)
+
+
+def make_period_page(rows, start_date, end_date, page, page_size=50):
+    import unicodedata
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * page_size
+
+    lines = [
+        "📊 **기간별 점수 조회**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 `{start_date} 00:00 ~ {end_date} 23:59`",
+        f"📄 **{page + 1} / {total_pages} 페이지**  •  총 {len(rows)}명",
+        "",
+        "```text",
+        "순위  혈맹원                    출석   가산점   총점",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ]
+
+    for i, row in enumerate(rows[offset:offset + page_size], start=offset + 1):
+        _, username, attendance_points, bonus_points, total_points = row
+        name = str(username)
+        display = ""
+        width = 0
+        for ch in name:
+            cw = 2 if unicodedata.east_asian_width(ch) in "WFA" else 1
+            if width + cw > 20:
+                break
+            display += ch
+            width += cw
+        display += " " * max(0, 20 - width)
+
+        rank_text = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i:>3}")
+        lines.append(
+            f"{rank_text:<4}  {display}  "
+            f"{int(attendance_points or 0):>4}   "
+            f"{int(bonus_points or 0):>5}   "
+            f"{int(total_points or 0):>4}"
+        )
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "```"
+    ]
+    return "\n".join(lines), total_pages, page
+
+
+class PeriodScoreView(discord.ui.View):
+    def __init__(self, ctx, rows, start_date, end_date, page=0):
+        super().__init__(timeout=300)
+        self.ctx_id = ctx.author.id
+        self.rows = rows
+        self.start_date = start_date
+        self.end_date = end_date
+        self.page = page
+        self.page_size = 50
+        self.refresh_buttons()
+
+    def refresh_buttons(self):
+        total = max(1, (len(self.rows) + self.page_size - 1) // self.page_size)
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= total - 1
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.ctx_id:
+            await interaction.response.send_message(
+                "❌ 이 기간 조회를 실행한 사람만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def update_page(self, interaction):
+        content, _, self.page = make_period_page(
+            self.rows, self.start_date, self.end_date,
+            self.page, self.page_size
+        )
+        self.refresh_buttons()
+        await interaction.response.edit_message(content=content, view=self)
+
+    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction, button):
+        self.page = max(0, self.page - 1)
+        await self.update_page(interaction)
+
+    @discord.ui.button(label="다음 ▶", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction, button):
+        total = max(1, (len(self.rows) + self.page_size - 1) // self.page_size)
+        self.page = min(total - 1, self.page + 1)
+        await self.update_page(interaction)
+
+
+class PeriodQueryModal(discord.ui.Modal, title="📅 기간 조회"):
+    start_date = discord.ui.TextInput(
+        label="시작 날짜",
+        placeholder="예: 2026-08-01",
+        max_length=10,
+        required=True
+    )
+    end_date = discord.ui.TextInput(
+        label="종료 날짜",
+        placeholder="예: 2026-08-17",
+        max_length=10,
+        required=True
+    )
+
+    async def on_submit(self, interaction):
+        if interaction.channel_id != ADMIN_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        start_text = self.start_date.value.strip()
+        end_text = self.end_date.value.strip()
+
+        try:
+            start = datetime.strptime(start_text, "%Y-%m-%d").date()
+            end = datetime.strptime(end_text, "%Y-%m-%d").date()
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ 날짜 형식이 올바르지 않습니다. 예: `2026-08-01`",
+                ephemeral=True
+            )
+
+        if start > end:
+            return await interaction.response.send_message(
+                "❌ 시작 날짜가 종료 날짜보다 늦을 수 없습니다.",
+                ephemeral=True
+            )
+
+        if (end - start).days > 366:
+            return await interaction.response.send_message(
+                "❌ 최대 1년 범위까지만 조회할 수 있습니다.",
+                ephemeral=True
+            )
+
+        try:
+            rows = await run_db(load_period_scores, start.isoformat(), end.isoformat())
+
+            if not rows:
+                return await interaction.response.send_message(
+                    f"📊 **기간 조회 결과**\n\n`{start_text} ~ {end_text}`\n\n"
+                    "조회된 기록이 없습니다."
+                )
+
+            content, _, page = make_period_page(
+                rows, start.isoformat(), end.isoformat(), 0, 50
+            )
+            await interaction.response.send_message(
+                content,
+                view=PeriodScoreView(
+                    interaction, rows,
+                    start.isoformat(), end.isoformat(), page
+                )
+            )
+        except Exception as e:
+            print(f"[기간조회 오류] {type(e).__name__}: {e}")
+            await interaction.response.send_message(
+                f"❌ 기간 조회 중 DB 오류가 발생했습니다.\n```{e}```",
+                ephemeral=True
+            )
+
+
+class PeriodQueryStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="📅 기간 입력", style=discord.ButtonStyle.primary)
+    async def open_modal(self, interaction, button):
+        if interaction.channel_id != ADMIN_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ 관리자 전용방에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+        await interaction.response.send_modal(PeriodQueryModal())
+
+
+@bot.command(name="기간조회")
+async def period_query_command(ctx):
+    if not is_admin_channel(ctx):
+        return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
+
+    await ctx.send(
+        "📅 **기간 조회**\n\n"
+        "조회할 시작 날짜와 종료 날짜를 입력해주세요.\n\n"
+        "**예시**\n"
+        "시작 날짜: `2026-08-01`\n"
+        "종료 날짜: `2026-08-17`\n\n"
+        "아래 **📅 기간 입력** 버튼을 눌러 날짜를 입력하세요.",
+        view=PeriodQueryStartView()
     )
 
 
