@@ -114,6 +114,88 @@ def run_web_server():
     )
 
 
+DISCORD_LOGIN_TIMEOUT = 60
+DISCORD_LOGIN_PROGRESS_INTERVAL = 10
+
+
+async def _discord_start_with_timeout(token):
+    """
+    Discord Gateway 최초 연결이 무한 대기하지 않도록 보호합니다.
+
+    핵심은 bot.start() 자체를 60초로 timeout시키는 것이 아니라,
+    bot.start()를 백그라운드 task로 실행한 뒤 bot.is_ready()가
+    60초 안에 True가 되는지를 별도로 감시하는 것입니다.
+    로그인에 성공하면 bot.start()는 정상적으로 계속 실행됩니다.
+    """
+    start_task = asyncio.create_task(
+        bot.start(token, reconnect=True),
+        name="discord-gateway-start"
+    )
+
+    started_at = asyncio.get_running_loop().time()
+    next_progress = started_at
+
+    try:
+        while True:
+            # bot.start()가 먼저 끝났다면 성공/실패 원인을 즉시 확인합니다.
+            if start_task.done():
+                # 예외가 있으면 여기서 그대로 발생시켜 바깥에서 로그 처리합니다.
+                start_task.result()
+                if not bot.is_ready():
+                    raise RuntimeError(
+                        "Discord start()가 종료되었지만 Gateway READY를 받지 못했습니다."
+                    )
+                return
+
+            if bot.is_ready():
+                elapsed = asyncio.get_running_loop().time() - started_at
+                print(f"[DISCORD] Gateway READY 수신 완료 ({elapsed:.1f}초)")
+                # 로그인 성공 후에는 bot.start()를 계속 실행시킵니다.
+                await start_task
+                return
+
+            now = asyncio.get_running_loop().time()
+            elapsed = now - started_at
+
+            if elapsed >= DISCORD_LOGIN_TIMEOUT:
+                print(
+                    f"[DISCORD LOGIN TIMEOUT] {DISCORD_LOGIN_TIMEOUT}초 동안 "
+                    "Gateway READY를 받지 못했습니다."
+                )
+                print(
+                    "[DISCORD LOGIN TIMEOUT] Render 웹 서버는 유지하고 "
+                    "Discord 연결 task만 종료합니다."
+                )
+                start_task.cancel()
+                try:
+                    await start_task
+                except asyncio.CancelledError:
+                    pass
+                return
+
+            if now >= next_progress:
+                print(
+                    f"[DISCORD] Gateway 연결 대기 중... "
+                    f"{int(elapsed)}초 / {DISCORD_LOGIN_TIMEOUT}초"
+                )
+                next_progress = now + DISCORD_LOGIN_PROGRESS_INTERVAL
+
+            await asyncio.sleep(0.5)
+
+    except asyncio.CancelledError:
+        if not start_task.done():
+            start_task.cancel()
+        raise
+    except Exception:
+        if not start_task.done():
+            start_task.cancel()
+            try:
+                await start_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
+
+
 def run_discord_bot():
     token = os.getenv("DISCORD_TOKEN")
 
@@ -122,35 +204,66 @@ def run_discord_bot():
         return
 
     print("[DISCORD] 봇 로그인 시도")
+    print(
+        f"[DISCORD] 최초 Gateway 연결 제한시간: "
+        f"{DISCORD_LOGIN_TIMEOUT}초"
+    )
 
-    try:
-        bot.run(token)
-    except discord.HTTPException as e:
-        # 로그인 단계의 429/Cloudflare 1015는 Render 프로세스를
-        # 종료시키지 않고 웹 서버를 계속 살려 둡니다.
-        if getattr(e, "status", None) == 429:
+    async def runner():
+        try:
+            await _discord_start_with_timeout(token)
+        except discord.LoginFailure as e:
+            print(
+                f"[DISCORD LOGIN FAILURE] 토큰 또는 로그인 정보가 잘못되었습니다: {e}"
+            )
+        except discord.HTTPException as e:
+            status = getattr(e, "status", None)
             retry_after = getattr(e, "retry_after", None)
+            if status == 429:
+                print(
+                    f"[DISCORD LOGIN 429] Discord 로그인 요청이 제한되었습니다. "
+                    f"retry_after={retry_after!r}"
+                )
+                print(
+                    "[DISCORD LOGIN] 자동 재시도하지 않습니다. "
+                    "반복 로그인으로 제한이 악화되는 것을 방지합니다."
+                )
+            else:
+                print(
+                    f"[DISCORD LOGIN HTTP ERROR] "
+                    f"status={status} {type(e).__name__}: {e}"
+                )
+        except asyncio.TimeoutError:
+            print("[DISCORD LOGIN TIMEOUT ERROR] Gateway 연결 시간이 초과되었습니다.")
+        except Exception as e:
             print(
-                f"[DISCORD LOGIN 429] Discord 로그인 요청이 제한되었습니다. "
-                f"retry_after={retry_after!r}"
+                f"[DISCORD LOGIN ERROR] {type(e).__name__}: {e}"
             )
-            print(
-                "[DISCORD LOGIN] 자동 재시도를 하지 않습니다. "
-                "반복 로그인으로 차단을 악화시키지 않도록 Render는 "
-                "계속 Live 상태로 유지합니다."
-            )
-        else:
-            print(
-                f"[DISCORD LOGIN HTTP ERROR] "
-                f"{type(e).__name__}: {e}"
-            )
-    except Exception as e:
-        print(
-            f"[DISCORD LOGIN ERROR] {type(e).__name__}: {e}"
-        )
+        finally:
+            # timeout/예외로 끝났을 때 연결이 남아 있지 않도록 정리합니다.
+            try:
+                if not bot.is_closed():
+                    await bot.close()
+            except Exception as close_error:
+                print(
+                    f"[DISCORD CLOSE ERROR] {type(close_error).__name__}: "
+                    f"{close_error}"
+                )
+
         print(
             "[DISCORD LOGIN] Discord 봇 스레드가 종료되었습니다. "
             "웹 서버는 계속 실행됩니다."
+        )
+
+    try:
+        asyncio.run(runner())
+    except Exception as e:
+        print(
+            f"[DISCORD THREAD ERROR] {type(e).__name__}: {e}"
+        )
+        print(
+            "[DISCORD] Discord 연결 스레드가 종료되었습니다. "
+            "Render 웹 서버는 계속 실행됩니다."
         )
 
 
