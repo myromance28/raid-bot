@@ -1808,269 +1808,185 @@ async def drop_list_command(ctx):
 
     try:
         drops = await run_db(load_all_drops)
-
         if not drops:
             return await ctx.send(
-                "🎁 **전체 득템 내역**\n\n"
-                "현재 등록된 득템 내역이 없습니다."
+                "🎁 **전체 득템 내역**\n\n현재 등록된 득템 내역이 없습니다."
             )
 
-        def display_width(value):
-            import unicodedata
-            width = 0
-            for ch in str(value):
-                width += 2 if unicodedata.east_asian_width(ch) in "WFA" else 1
-            return width
+        lines = ["🎁 **전체 득템 내역**", "━━━━━━━━━━━━━━━━━━━━", ""]
+        for index, row in enumerate(drops, start=1):
+            drop_id, boss_name, drop_name, username, created_at = row
+            time_text = created_at.strftime("%m-%d %H:%M") if created_at else "-"
+            lines.append(f"**{index}️⃣ {drop_name}**")
+            lines.append(f"   👹 {boss_name}　│　👤 {username}　│　🕒 {time_text}")
+            lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
 
-        def fit_cell(value, width):
-            value = str(value)
-            result = ""
-            current = 0
+        chunks=[]
+        current=""
+        for line in lines:
+            if len(current)+len(line)+1 > 1900:
+                chunks.append(current)
+                current=""
+            current += line+"\n"
+        if current.strip():
+            chunks.append(current)
 
-            for ch in value:
-                ch_width = display_width(ch)
-                if current + ch_width > width:
-                    break
-                result += ch
-                current += ch_width
-
-            return result + " " * max(0, width - current)
-
-        # 등록 순서대로 표시:
-        # 득템이름 - 보스 - 등록자 - 날짜
-        headers = ["득템이름", "보스", "등록자", "날짜"]
-
-        rows = []
-        for drop_id, boss_name, drop_name, username, created_at in drops:
-            time_text = (
-                created_at.strftime("%m-%d %H:%M")
-                if created_at else "-"
-            )
-            rows.append([
-                drop_name,
-                boss_name,
-                username,
-                time_text
-            ])
-
-        # Discord 코드블록 안에서 엑셀처럼 보이도록 고정 폭 표 구성
-        widths = [14, 12, 12, 14]
-
-        table_lines = [
-            " | ".join(
-                fit_cell(headers[i], widths[i])
-                for i in range(4)
-            ),
-            "-+-".join("-" * width for width in widths)
-        ]
-
-        for row in rows:
-            table_lines.append(
-                " | ".join(
-                    fit_cell(row[i], widths[i])
-                    for i in range(4)
-                )
-            )
-
-        # Discord 2000자 제한 대응
-        chunks = []
-        current_lines = ["🎁 **전체 득템 내역**", "```"]
-
-        for line in table_lines:
-            if sum(len(x) + 1 for x in current_lines) + len(line) + 4 > 1900:
-                current_lines.append("```")
-                chunks.append("\n".join(current_lines))
-                current_lines = ["```"]
-
-            current_lines.append(line)
-
-        current_lines.append("```")
-        chunks.append("\n".join(current_lines))
-
-        for index, chunk in enumerate(chunks):
-            if index == len(chunks) - 1:
-                await ctx.send(
-                    chunk,
-                    view=DropListView(drops)
-                )
+        for i, chunk in enumerate(chunks):
+            if i == len(chunks)-1:
+                await ctx.send(chunk, view=DropListView(drops))
             else:
                 await ctx.send(chunk)
 
     except Exception as e:
         print(f"[득템 조회 오류] {type(e).__name__}: {e}")
-        await ctx.send(
-            f"❌ 득템 내역 조회 중 오류가 발생했습니다.\n```{e}```"
-        )
+        await ctx.send(f"❌ 득템 내역 조회 중 오류가 발생했습니다.\n```{e}```")
 
 
+def make_weekly_page(rows, period_name, start_date, end_date, page, page_size=50):
+    total_pages=max(1,(len(rows)+page_size-1)//page_size)
+    page=max(0,min(page,total_pages-1))
+    offset=page*page_size
+    page_rows=rows[offset:offset+page_size]
 
-def load_weekly_scores(start_date, end_date):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT
-                    user_id,
-                    MAX(username) AS username,
-                    SUM(attendance_points) AS attendance_points,
-                    SUM(bonus_points) AS bonus_points,
-                    SUM(attendance_points + bonus_points) AS total_points
-                FROM (
-                    SELECT
-                        user_id,
-                        username,
-                        COALESCE(SUM(points), 0) AS attendance_points,
-                        0::BIGINT AS bonus_points
-                    FROM attendance_v2
-                    WHERE date >= %s
-                      AND date <= %s
-                    GROUP BY user_id, username
-
-                    UNION ALL
-
-                    SELECT
-                        user_id,
-                        username,
-                        0::BIGINT AS attendance_points,
-                        COALESCE(SUM(points), 0) AS bonus_points
-                    FROM bonus_attendance
-                    WHERE date >= %s
-                      AND date <= %s
-                    GROUP BY user_id, username
-                ) AS score_rows
-                GROUP BY user_id
-                ORDER BY total_points DESC, username ASC
-            """, (
-                start_date,
-                end_date,
-                start_date,
-                end_date
-            ))
-
-            return cursor.fetchall()
-
-    finally:
-        release_db_connection(conn)
-
-
-def make_weekly_table(rows, period_name, start_date, end_date):
-    if not rows:
-        return (
-            f"📊 **{period_name} 주간 점수**\n\n"
-            f"기간: `{start_date} 00:00 ~ {end_date} 현재`\n\n"
-            "해당 기간에 기록된 점수가 없습니다."
-        )
-
-    def display_width(value):
-        import unicodedata
-        return sum(
-            2 if unicodedata.east_asian_width(ch) in "WFA" else 1
-            for ch in str(value)
-        )
-
-    def fit_cell(value, width):
-        value = str(value)
-        result = ""
-        current = 0
-
-        for ch in value:
-            cw = display_width(ch)
-            if current + cw > width:
-                break
-            result += ch
-            current += cw
-
-        return result + " " * max(0, width - current)
-
-    widths = [4, 14, 8, 8, 8]
-    headers = ["순위", "혈맹원", "출석", "가산점", "총점"]
-
-    lines = [
+    lines=[
         f"📊 **{period_name} 주간 점수**",
-        f"기간: `{start_date} 00:00 ~ {end_date} 현재`",
-        "```",
-        " | ".join(fit_cell(headers[i], widths[i]) for i in range(5)),
-        "-+-".join("-" * w for w in widths)
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 `{start_date} 00:00 ~ {end_date} 현재`",
+        f"📄 **{page+1} / {total_pages} 페이지**  •  총 {len(rows)}명",
+        "",
+        "```text",
+        "순위  혈맹원                    출석   가산점   총점",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     ]
 
-    for rank, row in enumerate(rows, start=1):
-        user_id, username, attendance_points, bonus_points, total_points = row
-        values = [
-            rank,
-            username,
-            int(attendance_points or 0),
-            int(bonus_points or 0),
-            int(total_points or 0)
-        ]
+    import unicodedata
+    for i,row in enumerate(page_rows):
+        rank=offset+i+1
+        _,username,attendance_points,bonus_points,total_points=row
+        name=str(username)
+        display=""
+        width=0
+        for ch in name:
+            cw=2 if unicodedata.east_asian_width(ch) in "WFA" else 1
+            if width+cw>20: break
+            display+=ch
+            width+=cw
+        display+=" " * max(0,20-width)
+
+        rank_text={1:"🥇",2:"🥈",3:"🥉"}.get(rank,f"{rank:>3}")
         lines.append(
-            " | ".join(
-                fit_cell(values[i], widths[i])
-                for i in range(5)
+            f"{rank_text:<4}  {display}  "
+            f"{int(attendance_points or 0):>4}   "
+            f"{int(bonus_points or 0):>5}   "
+            f"{int(total_points or 0):>4}"
+        )
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "```"
+    ]
+    return "\n".join(lines),total_pages,page
+
+
+class WeeklyScoreView(discord.ui.View):
+    def __init__(self,ctx,rows,period_name,start_date,end_date,page=0):
+        super().__init__(timeout=300)
+        self.ctx_id=ctx.author.id
+        self.rows=rows
+        self.period_name=period_name
+        self.start_date=start_date
+        self.end_date=end_date
+        self.page=page
+        self.page_size=50
+        self.refresh_buttons()
+
+    def refresh_buttons(self):
+        total_pages=max(1,(len(self.rows)+self.page_size-1)//self.page_size)
+        self.previous_button.disabled=self.page<=0
+        self.next_button.disabled=self.page>=total_pages-1
+
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.ctx_id:
+            await interaction.response.send_message(
+                "❌ 이 주간 점수표를 실행한 사람만 페이지를 넘길 수 있습니다.",
+                ephemeral=True
             )
+            return False
+        return True
+
+    async def update_page(self,interaction):
+        content,_,current_page=make_weekly_page(
+            self.rows,self.period_name,self.start_date,
+            self.end_date,self.page,self.page_size
         )
+        self.page=current_page
+        self.refresh_buttons()
+        await interaction.response.edit_message(content=content,view=self)
 
-    lines.append("```")
-    return "\n".join(lines)
+    @discord.ui.button(label="◀ 이전",style=discord.ButtonStyle.secondary)
+    async def previous_button(self,interaction,button):
+        if self.page>0:
+            self.page-=1
+        await self.update_page(interaction)
+
+    @discord.ui.button(label="다음 ▶",style=discord.ButtonStyle.primary)
+    async def next_button(self,interaction,button):
+        total_pages=max(1,(len(self.rows)+self.page_size-1)//self.page_size)
+        if self.page<total_pages-1:
+            self.page+=1
+        await self.update_page(interaction)
 
 
-async def weekly_score_command(ctx, weeks=1):
+async def weekly_score_command(ctx,weeks=1):
     if not is_admin_channel(ctx):
-        return await ctx.send(
-            "❌ 관리자 전용방에서만 사용할 수 있습니다."
-        )
+        return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
 
-    now = datetime.now(KST)
-    today = now.date()
+    now=datetime.now(KST)
+    today=now.date()
+    current_monday=today-timedelta(days=today.weekday())
+    start_date=current_monday-timedelta(days=(weeks-1)*7)
 
-    # 이번 주 월요일 00:00을 기준으로 계산.
-    # !주간   = 이번 주 월요일 ~ 현재
-    # !2주간  = 저번 주 월요일 ~ 현재
-    # !3주간  = 저저번 주 월요일 ~ 현재
-    # !4주간  = 저저저번 주 월요일 ~ 현재
-    current_monday = today - timedelta(days=today.weekday())
-    start_date = current_monday - timedelta(days=(weeks - 1) * 7)
-
-    rows = await run_db(
+    rows=await run_db(
         load_weekly_scores,
         start_date.isoformat(),
         today.isoformat()
     )
 
-    period_name = {
-        1: "이번 주",
-        2: "최근 2주",
-        3: "최근 3주",
-        4: "최근 4주"
-    }[weeks]
+    period_name={1:"이번 주",2:"최근 2주",3:"최근 3주",4:"최근 4주"}[weeks]
+    content,_,page=make_weekly_page(
+        rows,period_name,start_date.isoformat(),
+        today.isoformat(),0,50
+    )
 
     await ctx.send(
-        make_weekly_table(
-            rows,
-            period_name,
-            start_date.isoformat(),
-            today.isoformat()
+        content,
+        view=WeeklyScoreView(
+            ctx,rows,period_name,
+            start_date.isoformat(),today.isoformat(),page
         )
     )
 
 
 @bot.command(name="주간")
 async def weekly_command(ctx):
-    await weekly_score_command(ctx, 1)
+    await weekly_score_command(ctx,1)
 
 
 @bot.command(name="2주간")
 async def two_week_command(ctx):
-    await weekly_score_command(ctx, 2)
+    await weekly_score_command(ctx,2)
 
 
 @bot.command(name="3주간")
 async def three_week_command(ctx):
-    await weekly_score_command(ctx, 3)
+    await weekly_score_command(ctx,3)
 
 
 @bot.command(name="4주간")
 async def four_week_command(ctx):
-    await weekly_score_command(ctx, 4)
+    await weekly_score_command(ctx,4)
+
 
 
 @bot.command(name="득템초기화")
