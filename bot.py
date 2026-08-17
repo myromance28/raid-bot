@@ -7,6 +7,9 @@ import os
 import asyncio
 import random
 import string
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -51,6 +54,58 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise Exception("DATABASE_URL 환경변수 없음")
+
+# =====================================================
+# 🔹 Google Sheets 연동
+# =====================================================
+# Render 환경변수에 아래 2개를 등록해야 합니다.
+# GOOGLE_SHEETS_URL    = Apps Script 웹 앱 /exec 주소
+# GOOGLE_SHEETS_SECRET = Apps Script에서 설정한 비밀키
+GOOGLE_SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL", "").strip()
+GOOGLE_SHEETS_SECRET = os.getenv("GOOGLE_SHEETS_SECRET", "").strip()
+
+
+def send_to_google_sheet(date_text, time_text, user_id, username, points):
+    """출석/가산점 기록을 Apps Script를 통해 Google Sheets에 추가합니다."""
+    if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
+        print("[Google Sheets] 환경변수가 없어 기록을 건너뜁니다.")
+        return False
+
+    payload = {
+        "secret": GOOGLE_SHEETS_SECRET,
+        "date": str(date_text),
+        "time": str(time_text),
+        "user_id": str(user_id),
+        "username": str(username),
+        "points": int(points),
+    }
+
+    try:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            GOOGLE_SHEETS_URL,
+            data=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+
+        print(f"[Google Sheets] 기록 성공: {username} / +{points}점 / {response_text}")
+        return True
+
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(e)
+        print(f"[Google Sheets] HTTP 오류 {e.code}: {detail}")
+        return False
+
+    except Exception as e:
+        print(f"[Google Sheets] 전송 오류: {type(e).__name__}: {e}")
+        return False
 
 
 def get_db_connection():
@@ -1006,6 +1061,17 @@ class BonusPasswordModal(
                     ephemeral=True
                 )
 
+            # DB 저장이 성공한 경우에만 Google Sheets에도 기록
+            now_text = datetime.now(KST).strftime("%H:%M:%S")
+            await run_db(
+                send_to_google_sheet,
+                bonus_date,
+                now_text,
+                user_id,
+                username,
+                bonus_points
+            )
+
             await interaction.followup.send(
                 f"🔵 **가산점 +{bonus_points}점 지급 완료!**\n"
                 f"👤 {username}\n"
@@ -1311,6 +1377,17 @@ class AttendancePasswordModal(
                     "⚠️ 이미 이번 출석에 참여하셨습니다.",
                     ephemeral=True
                 )
+
+            # DB 저장이 성공한 경우에만 Google Sheets에도 기록
+            now_text = datetime.now(KST).strftime("%H:%M:%S")
+            await run_db(
+                send_to_google_sheet,
+                current_date,
+                now_text,
+                user_id,
+                username,
+                1
+            )
 
             await interaction.followup.send(
                 f"✅ 출석 완료!\n"
