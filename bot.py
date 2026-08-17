@@ -79,26 +79,87 @@ async def run_db(func, *args):
 
 
 # =====================================================
-# 🔹 Flask KeepAlive
+# 🔹 Render Web Service / Health Server
 # =====================================================
+# Render Web Service는 PORT에 HTTP 서버가 떠 있어야 합니다.
+# Flask를 메인 프로세스로 실행하고 Discord 봇을 별도 스레드에서
+# 실행하여 Discord 로그인 실패(429/1015)가 발생해도
+# Render의 포트 스캔 자체가 실패하지 않도록 합니다.
 app = Flask(__name__)
 
 
 @app.route("/")
 def home():
-    return "OK"
+    return "RAID BOT OK", 200
 
 
-def run():
+@app.route("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "raid-bot",
+        "kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    }, 200
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    print(f"[WEB] Render PORT={port} 서버 시작")
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-        threaded=True
+        port=port,
+        threaded=True,
+        debug=False,
+        use_reloader=False
     )
 
 
-def keep_alive():
-    Thread(target=run, daemon=True).start()
+def run_discord_bot():
+    token = os.getenv("DISCORD_TOKEN")
+
+    if not token:
+        print("[DISCORD] DISCORD_TOKEN 환경변수가 없습니다.")
+        return
+
+    print("[DISCORD] 봇 로그인 시도")
+
+    try:
+        bot.run(token)
+    except discord.HTTPException as e:
+        # 로그인 단계의 429/Cloudflare 1015는 Render 프로세스를
+        # 종료시키지 않고 웹 서버를 계속 살려 둡니다.
+        if getattr(e, "status", None) == 429:
+            retry_after = getattr(e, "retry_after", None)
+            print(
+                f"[DISCORD LOGIN 429] Discord 로그인 요청이 제한되었습니다. "
+                f"retry_after={retry_after!r}"
+            )
+            print(
+                "[DISCORD LOGIN] 자동 재시도를 하지 않습니다. "
+                "반복 로그인으로 차단을 악화시키지 않도록 Render는 "
+                "계속 Live 상태로 유지합니다."
+            )
+        else:
+            print(
+                f"[DISCORD LOGIN HTTP ERROR] "
+                f"{type(e).__name__}: {e}"
+            )
+    except Exception as e:
+        print(
+            f"[DISCORD LOGIN ERROR] {type(e).__name__}: {e}"
+        )
+        print(
+            "[DISCORD LOGIN] Discord 봇 스레드가 종료되었습니다. "
+            "웹 서버는 계속 실행됩니다."
+        )
+
+
+def start_discord_bot():
+    Thread(
+        target=run_discord_bot,
+        name="discord-bot",
+        daemon=True
+    ).start()
 
 
 # =====================================================
@@ -2586,8 +2647,10 @@ async def on_ready():
 # =====================================================
 # 🔹 실행
 # =====================================================
-keep_alive()
-
-bot.run(
-    os.getenv("DISCORD_TOKEN")
-)
+# Render Web Service의 포트를 메인 프로세스에서 즉시 열고,
+# Discord 봇은 별도 스레드에서 실행합니다.
+#
+# Discord 로그인 단계에서 429 / Cloudflare 1015가 발생하더라도
+# Render가 "open ports 없음"으로 배포를 실패시키지 않게 합니다.
+start_discord_bot()
+run_web_server()
