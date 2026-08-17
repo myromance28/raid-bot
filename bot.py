@@ -30,9 +30,10 @@ ATTENDANCE_CHANNEL_ID = 1538446431772217405
 ADMIN_CHANNEL_ID = 1538446527968706691
 
 # 출석 패널 / 비밀번호 생성 시간
-# 테스트 모드: 1분마다 새로운 출석 세션 생성
+# 테스트 모드: 2분마다 새로운 출석 세션 생성
+# 실제 운영 전환 시 TEST_MODE = False
 TEST_MODE = True
-TEST_INTERVAL_MINUTES = 1
+TEST_INTERVAL_MINUTES = 2
 
 # 실제 운영 시간: 03:00 / 09:00 / 15:00 / 21:00
 ATTENDANCE_HOURS = {3, 9, 15, 21}
@@ -199,6 +200,24 @@ def generate_password():
     return "".join(random.choices(string.digits, k=4))
 
 
+def get_test_session_start(now=None):
+    """테스트 모드에서 2분 단위로 고정된 세션 시작 시각을 반환합니다."""
+    if now is None:
+        now = datetime.now(KST)
+
+    bucket_minute = (now.minute // TEST_INTERVAL_MINUTES) * TEST_INTERVAL_MINUTES
+
+    return now.replace(
+        minute=bucket_minute,
+        second=0,
+        microsecond=0
+    )
+
+
+def get_test_session_slot(now=None):
+    return get_test_session_start(now).strftime("%H%M")
+
+
 def get_current_session():
     now = datetime.now(KST)
     return (
@@ -352,7 +371,7 @@ def load_active_session():
 
         try:
             if TEST_MODE:
-                # 테스트 모드의 세션은 HHMM 형식 (예: 2238)
+                # 테스트 모드의 세션은 HHMM 형식 (2분 단위, 예: 2238)
                 if len(str(slot_text)) != 4:
                     return None
                 session_hour = int(str(slot_text)[:2])
@@ -378,7 +397,7 @@ def load_active_session():
         )
 
         session_duration = (
-            timedelta(minutes=1)
+            timedelta(minutes=TEST_INTERVAL_MINUTES)
             if TEST_MODE
             else timedelta(hours=3)
         )
@@ -1346,7 +1365,7 @@ class AttendancePasswordModal(
             )
 
             session_duration = (
-                timedelta(minutes=1)
+                timedelta(minutes=TEST_INTERVAL_MINUTES)
                 if TEST_MODE
                 else timedelta(hours=3)
             )
@@ -1493,9 +1512,10 @@ async def automatic_attendance_panel():
     date_text = now.strftime("%Y-%m-%d")
 
     if TEST_MODE:
-        # 테스트 모드에서는 매 분을 별도의 출석 세션으로 사용
-        # 예: 22:01 -> 2201, 22:02 -> 2202
-        slot_text = now.strftime("%H%M")
+        # 테스트 모드에서는 2분마다 별도의 출석 세션을 사용합니다.
+        # 예: 22:00~22:01 = 2200 세션
+        #     22:02~22:03 = 2202 세션
+        slot_text = get_test_session_slot(now)
         panel_key = f"{date_text}_{slot_text}"
     else:
         # 운영 모드: 03:00 / 09:00 / 15:00 / 21:00
@@ -1548,13 +1568,13 @@ async def automatic_attendance_panel():
     )
 
     try:
-        # 테스트 모드에서는 새 세션을 만들기 전에 이전 패널/비밀번호를 삭제한다.
-        # 별도의 cleanup 루프가 같은 분에 새 패널을 지우지 않도록 한다.
+        # 테스트 모드에서는 새 2분 세션을 만들기 전에 이전 패널/비밀번호를 삭제한다.
+        # 같은 세션 동안에는 panel_key가 같으므로 비밀번호가 유지된다.
         if TEST_MODE:
             await clear_both_channels()
 
         # 일반 출석창
-        validity_text = "1분" if TEST_MODE else "3시간"
+        validity_text = f"{TEST_INTERVAL_MINUTES}분" if TEST_MODE else "3시간"
 
         # 여기서는 출석 패널만 생성한다.
         # 가산점은 !가산점 명령어로 생성된 활성 세션이 있을 때만
@@ -1585,7 +1605,7 @@ async def automatic_attendance_panel():
 
         print(
             f"[자동 출석] {date_text} "
-            f"[{slot_text}:00] "
+            f"[세션 {slot_text}] "
             f"비밀번호={password}"
         )
 
@@ -1602,7 +1622,7 @@ async def automatic_channel_cleanup():
     now = datetime.now(KST)
 
     if TEST_MODE:
-        # 출석 패널은 1분마다 automatic_attendance_panel이 교체한다.
+        # 출석 패널은 2분마다 automatic_attendance_panel이 교체한다.
         # 가산점은 별도 생성이므로 생성 후 1시간 동안 유지한다.
         global bonus_password
         global bonus_date
