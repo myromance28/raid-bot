@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================
-# RAID BOT - 출석 전용 테스트 버전
+# RAID BOT - 운영 버전
 # =====================================================
 
 import os
@@ -29,9 +29,8 @@ ATTENDANCE_CHANNEL_ID = 1538446431772217405
 # 관리자 전용 비밀번호 방
 ADMIN_CHANNEL_ID = 1538446527968706691
 
-# 출석 패널 / 비밀번호 생성 시간
-# 테스트 모드: 2분마다 새로운 출석 세션 생성
-TEST_MODE = True
+# 운영 모드: 한국시간 03:00 / 09:00 / 15:00 / 21:00
+TEST_MODE = False
 TEST_INTERVAL_MINUTES = 2
 
 # Google Apps Script 웹앱
@@ -126,6 +125,8 @@ bonus_created_at = None
 bonus_message_ids = set()
 boss_names = []
 boss_panel_message_id = None
+# 자동 출석 패널 삭제 예약: (delete_at, message)
+panel_delete_queue = []
 
 
 def get_current_slot(hour=None):
@@ -145,6 +146,54 @@ def get_current_session():
         now.strftime("%Y-%m-%d"),
         get_current_slot(now.hour)
     )
+
+
+def get_active_attendance_period(now=None):
+    """현재 시각이 실제 출석 가능한 3시간 구간인지 반환한다.
+
+    03시 세션 = 03:00~06:00 (집계 구간 00:00~06:00)
+    09시 세션 = 09:00~12:00 (집계 구간 06:00~12:00)
+    15시 세션 = 15:00~18:00 (집계 구간 12:00~18:00)
+    21시 세션 = 21:00~00:00 (집계 구간 18:00~24:00)
+    """
+    if now is None:
+        now = datetime.now(KST)
+
+    hour = now.hour
+    if 3 <= hour < 6:
+        slot = "03"
+        start_hour, end_hour = 3, 6
+    elif 9 <= hour < 12:
+        slot = "09"
+        start_hour, end_hour = 9, 12
+    elif 15 <= hour < 18:
+        slot = "15"
+        start_hour, end_hour = 15, 18
+    elif 21 <= hour < 24:
+        slot = "21"
+        start_hour, end_hour = 21, 24
+    else:
+        return None
+
+    start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    if end_hour == 24:
+        end = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        end = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+    # 출석 집계용 6시간 구간
+    aggregate_start_hour = start_hour - 3
+    aggregate_start = now.replace(hour=aggregate_start_hour, minute=0, second=0, microsecond=0)
+    aggregate_end = aggregate_start + timedelta(hours=6)
+
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "slot": slot,
+        "start": start,
+        "end": end,
+        "aggregate_start": aggregate_start,
+        "aggregate_end": aggregate_end,
+    }
 
 
 # =====================================================
@@ -542,6 +591,21 @@ def save_bonus_session(date_text, slot_text, points, password):
         conn.rollback()
         raise
 
+    finally:
+        release_db_connection(conn)
+
+
+def load_bonus_session(date_text, slot_text):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT points, password, created_at
+                FROM bonus_sessions
+                WHERE date=%s AND time_slot=%s
+                LIMIT 1
+            """, (date_text, slot_text))
+            return cursor.fetchone()
     finally:
         release_db_connection(conn)
 
@@ -1099,16 +1163,15 @@ class BonusPasswordModal(
 
             now = datetime.now(KST)
 
-            # 가산점은 생성 시점부터 정확히 1시간 유효
-            if now >= bonus_created_at + timedelta(hours=1):
-                bonus_password = None
-                bonus_date = None
-                bonus_slot = None
-                bonus_points = None
-                bonus_created_at = None
-
+            period = get_active_attendance_period(now)
+            if (
+                period is None
+                or period["date"] != bonus_date
+                or period["slot"] != bonus_slot
+                or now >= period["end"]
+            ):
                 return await interaction.followup.send(
-                    "❌ 가산점 유효시간이 종료되었습니다.",
+                    "❌ 현재 시간대의 가산점 유효시간이 종료되었습니다.",
                     ephemeral=True
                 )
 
@@ -1236,27 +1299,29 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
-        # 한 번 생성된 가산점 세션이 아직 1시간 안에 있다면
-        # 새 가산점을 덮어쓰지 않도록 한다.
-        if (
-            bonus_password is not None
-            and bonus_created_at is not None
-            and datetime.now(KST) < bonus_created_at + timedelta(hours=1)
-        ):
+        now = datetime.now(KST)
+
+        period = get_active_attendance_period(now)
+        if period is None:
             return await interaction.response.send_message(
-                f"⚠️ 현재 **+{bonus_points}점 가산점**이 이미 활성화되어 있습니다.\n"
-                "기존 가산점이 종료된 후 새 가산점을 생성해주세요.",
+                "❌ 현재 가산점을 만들 수 있는 시간대가 아닙니다.\n"
+                "가산점 시간대: 03~06 / 09~12 / 15~18 / 21~24 (한국시간)",
                 ephemeral=True
             )
 
-        now = datetime.now(KST)
-        date_text = now.strftime("%Y-%m-%d")
+        date_text = period["date"]
+        slot_text = period["slot"]
 
-        # 테스트 모드에서도 명령어를 누른 시각을 세션 키로 사용
-        if TEST_MODE:
-            slot_text = now.strftime("%H%M%S")
-        else:
-            slot_text = now.strftime("%H%M")
+        # 같은 6시간 집계 구간에서는 가산점 세션을 한 번만 생성한다.
+        existing_bonus = await run_db(
+            load_bonus_session, date_text, slot_text
+        )
+        if existing_bonus:
+            return await interaction.response.send_message(
+                f"⚠️ 현재 시간대에는 이미 **+{existing_bonus[0]}점 가산점**이 생성되어 있습니다.\n"
+                "같은 시간대에는 가산점을 한 번만 생성할 수 있습니다.",
+                ephemeral=True
+            )
 
         password = generate_password()
 
@@ -1281,7 +1346,7 @@ class BonusPointButton(discord.ui.Button):
                 f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
                 f"```{password}```\n\n"
-                f"⏰ 유효시간: 1시간",
+                f"⏰ 유효시간: {period['start'].strftime('%H:%M')} ~ {period['end'].strftime('%H:%M')}",
                 ephemeral=False
             )
 
@@ -1294,7 +1359,7 @@ class BonusPointButton(discord.ui.Button):
                     "🔵 **가산점 패널**\n"
                     f"⭐ 현재 가산점: **+{self.points}점**\n"
                     "아래 파란색 버튼을 눌러 가산점 비밀번호를 입력하세요.\n"
-                    "⏰ 유효시간: 1시간",
+                    f"⏰ 유효시간: {period['start'].strftime('%H:%M')} ~ {period['end'].strftime('%H:%M')}",
                     view=StandaloneBonusView()
                 )
                 bonus_message_ids.add(bonus_message.id)
@@ -1387,41 +1452,24 @@ class AttendancePasswordModal(
                     ephemeral=True
                 )
 
-            expected_date = now.strftime("%Y-%m-%d")
-
-            if current_date != expected_date:
+            period = get_active_attendance_period(now)
+            if period is None:
                 return await interaction.followup.send(
-                    "❌ 현재 출석 세션이 종료되었습니다.",
+                    "❌ 현재 출석 가능한 시간이 아닙니다.\n"
+                    "출석 시간: 03~06 / 09~12 / 15~18 / 21~24 (한국시간)",
                     ephemeral=True
                 )
 
-            try:
-                if TEST_MODE:
-                    session_hour = int(current_slot[:2])
-                    session_minute = int(current_slot[2:4])
-                else:
-                    session_hour = int(current_slot)
-                    session_minute = 0
-            except Exception:
+            if current_date != period["date"] or current_slot != period["slot"]:
                 return await interaction.followup.send(
-                    "❌ 출석 세션 정보를 확인할 수 없습니다.",
+                    "❌ 현재 출석 세션이 종료되었습니다.\n!출석으로 현재 출석창을 다시 불러주세요.",
                     ephemeral=True
                 )
 
-            session_start = now.replace(
-                hour=session_hour,
-                minute=session_minute,
-                second=0,
-                microsecond=0
-            )
+            session_start = period["start"]
+            session_end = period["end"]
 
-            session_duration = (
-                timedelta(minutes=TEST_INTERVAL_MINUTES)
-                if TEST_MODE
-                else timedelta(hours=3)
-            )
-
-            if now < session_start or now >= session_start + session_duration:
+            if now < session_start or now >= session_end:
                 return await interaction.followup.send(
                     "❌ 출석 가능 시간이 종료되었습니다.",
                     ephemeral=True
@@ -1513,22 +1561,17 @@ async def automatic_attendance_panel():
         return
 
     now = datetime.now(KST)
-    date_text = now.strftime("%Y-%m-%d")
+    period = get_active_attendance_period(now)
 
-    if TEST_MODE:
-        # 2분 단위 세션: 13:00~13:01, 13:02~13:03 ...
-        bucket_minute = (now.minute // TEST_INTERVAL_MINUTES) * TEST_INTERVAL_MINUTES
-        slot_text = f"{now.hour:02d}{bucket_minute:02d}"
-        session_start = now.replace(
-            minute=bucket_minute, second=0, microsecond=0
-        )
-        panel_key = f"{date_text}_{slot_text}"
-    else:
-        if now.hour not in ATTENDANCE_HOURS or now.minute != 0:
-            return
-        slot_text = get_current_slot(now.hour)
-        session_start = now.replace(minute=0, second=0, microsecond=0)
-        panel_key = f"{date_text}_{slot_text}"
+    # 출석 가능 시간대가 아니면 아무 Discord 요청도 하지 않는다.
+    if period is None:
+        return
+
+    date_text = period["date"]
+    slot_text = period["slot"]
+    session_start = period["start"]
+    session_end = period["end"]
+    panel_key = f"{date_text}_{slot_text}"
 
     if last_panel_key == panel_key:
         return
@@ -1540,7 +1583,7 @@ async def automatic_attendance_panel():
         print("[자동 패널 실패] 채널을 찾을 수 없습니다.")
         return
 
-    # 같은 세션을 DB에서 복구할 수 있으면 새 비밀번호를 만들지 않는다.
+    # 같은 세션을 DB에서 복구할 수 있으면 기존 비밀번호를 유지한다.
     session_row = await run_db(load_active_session)
     if session_row and session_row[0] == date_text and session_row[1] == slot_text:
         password = session_row[2]
@@ -1552,67 +1595,56 @@ async def automatic_attendance_panel():
     current_date = date_text
     current_slot = slot_text
 
-    validity_text = f"{TEST_INTERVAL_MINUTES}분" if TEST_MODE else "3시간"
     attendance_content = (
         f"📢 **출석 시간입니다!**\n"
         f"🕒 {session_start.strftime('%H:%M')} 출석\n\n"
         f"아래 버튼을 눌러 출석해주세요.\n"
         f"출석 시 **1점**이 지급됩니다.\n"
-        f"⏰ 유효시간: {validity_text}"
+        f"⏰ 출석 가능시간: {session_start.strftime('%H:%M')} ~ {session_end.strftime('%H:%M')}\n"
+        f"📊 집계시간: {period['aggregate_start'].strftime('%H:%M')} ~ {period['aggregate_end'].strftime('%H:%M')}"
     )
     admin_content = (
         f"🔐 **출석 비밀번호**\n\n"
         f"```{password}```\n\n"
         f"🕒 출석 시간: {session_start.strftime('%H:%M')}\n"
-        f"⏰ 유효시간: {validity_text}\n"
-        f"⚠️ 이 번호는 혈맹원에게 알려주세요."
+        f"⏰ 출석 가능시간: {session_start.strftime('%H:%M')} ~ {session_end.strftime('%H:%M')}\n"
+        f"📊 집계시간: {period['aggregate_start'].strftime('%H:%M')} ~ {period['aggregate_end'].strftime('%H:%M')}\n"
+        f"⚠️ 이 번호는 혈맹원에게 알려주세요.\n"
+        f"🗑️ 이 패널은 3시간 후 자동 삭제됩니다."
     )
 
     try:
-        # 기존 메시지를 재사용. 채널 전체 삭제/생성은 하지 않는다.
-        attendance_message = None
-        if attendance_message_id:
-            try:
-                attendance_message = await attendance_channel.fetch_message(int(attendance_message_id))
-                await attendance_message.edit(content=attendance_content, view=AttendanceView())
-            except discord.NotFound:
-                attendance_message_id = None
-            except discord.HTTPException as e:
-                if mark_discord_rate_limit(e, "출석 패널 수정"):
-                    return
-                raise
+        # 운영 버전은 세션마다 새 패널을 만들고 3시간 뒤 삭제한다.
+        # 채널 전체 삭제는 절대 하지 않는다.
+        attendance_message = await attendance_channel.send(
+            attendance_content, view=AttendanceView()
+        )
+        admin_message = await admin_channel.send(admin_content)
 
-        if attendance_message_id is None:
-            attendance_message = await attendance_channel.send(
-                attendance_content, view=AttendanceView()
-            )
-            attendance_message_id = attendance_message.id
-            await run_db(set_bot_state, "attendance_message_id", attendance_message.id)
+        attendance_message_id = attendance_message.id
+        admin_password_message_id = admin_message.id
 
-        admin_message = None
-        if admin_password_message_id:
-            try:
-                admin_message = await admin_channel.fetch_message(int(admin_password_message_id))
-                await admin_message.edit(content=admin_content)
-            except discord.NotFound:
-                admin_password_message_id = None
-            except discord.HTTPException as e:
-                if mark_discord_rate_limit(e, "관리자 비밀번호 수정"):
-                    return
-                raise
+        # 3시간 뒤 삭제 예약. Message 객체를 직접 사용하여 불필요한 fetch를 하지 않는다.
+        delete_at = session_start + timedelta(hours=3)
+        panel_delete_queue.append((delete_at, attendance_message, "출석 패널"))
+        panel_delete_queue.append((delete_at, admin_message, "관리자 비밀번호"))
 
-        if admin_password_message_id is None:
-            admin_message = await admin_channel.send(admin_content)
-            admin_password_message_id = admin_message.id
-            await run_db(set_bot_state, "admin_password_message_id", admin_message.id)
+        # 재시작 후에도 상태를 알 수 있도록 현재 패널 ID를 저장한다.
+        await run_db(set_bot_state, "attendance_message_id", attendance_message.id)
+        await run_db(set_bot_state, "admin_password_message_id", admin_message.id)
 
         last_panel_key = panel_key
-        print(f"[자동 출석] {date_text} [{slot_text}] 비밀번호={password}")
+        print(
+            f"[자동 출석] {date_text} [{slot_text}] "
+            f"한국시간 {session_start.strftime('%H:%M')} 생성 / "
+            f"{session_start.strftime('%H:%M')}~{session_end.strftime('%H:%M')} 출석 / "
+            f"비밀번호={password}"
+        )
 
     except discord.HTTPException as e:
-        if mark_discord_rate_limit(e, "자동 출석 패널"):
+        if mark_discord_rate_limit(e, "자동 출석 패널 생성"):
             return
-        print(f"[자동 출석 패널 오류] {e}")
+        print(f"[자동 출석 패널 Discord 오류] {e}")
     except Exception as e:
         print(f"[자동 출석 패널 오류] {type(e).__name__}: {e}")
 
@@ -1630,10 +1662,41 @@ async def automatic_channel_cleanup():
 
     now = datetime.now(KST)
 
+    # 출석/관리자 패널은 생성 후 정확히 3시간이 지나면 삭제한다.
+    if panel_delete_queue and not discord_rate_limited():
+        remaining = []
+        rate_limited_break = False
+        for delete_at, message, label in panel_delete_queue:
+            if now < delete_at or rate_limited_break:
+                remaining.append((delete_at, message, label))
+                continue
+            try:
+                await message.delete()
+                print(f"[패널 자동 삭제] {label} / message_id={message.id}")
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as e:
+                if mark_discord_rate_limit(e, f"{label} 삭제"):
+                    remaining.append((delete_at, message, label))
+                    rate_limited_break = True
+                else:
+                    print(f"[{label} 삭제 오류] {e}")
+            except Exception as e:
+                print(f"[{label} 삭제 오류] {type(e).__name__}: {e}")
+        panel_delete_queue[:] = remaining
+
+    # 가산점도 해당 출석 시간대(03~06 / 09~12 / 15~18 / 21~24)가
+    # 끝나면 종료한다. 같은 6시간 집계 구간에서는 1인 1회만 지급된다.
+    bonus_period = get_active_attendance_period(now)
+    bonus_expired = False
+    if bonus_password is not None and bonus_date is not None and bonus_slot is not None:
+        if bonus_period is None or bonus_period["date"] != bonus_date or bonus_period["slot"] != bonus_slot:
+            bonus_expired = True
+
     if (
         bonus_password is not None
         and bonus_created_at is not None
-        and now >= bonus_created_at + timedelta(hours=1)
+        and bonus_expired
     ):
         old_date = bonus_date
         old_slot = bonus_slot
@@ -1644,7 +1707,6 @@ async def automatic_channel_cleanup():
         bonus_points = None
         bonus_created_at = None
 
-        # 가산점 패널만 삭제. 채널 전체 삭제는 절대 하지 않는다.
         attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
         if attendance_channel is not None and not discord_rate_limited():
             for message_id in list(bonus_message_ids):
@@ -1822,10 +1884,49 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             )
 
 
+@bot.command(name="출석")
+async def attendance_command(ctx):
+    """현재 한국시간 기준 활성 출석 세션의 출석 버튼을 보여준다."""
+    now = datetime.now(KST)
+    period = get_active_attendance_period(now)
+
+    if period is None:
+        return await ctx.send(
+            "❌ 현재 출석 가능한 시간이 아닙니다.\n"
+            "출석 시간: 03~06 / 09~12 / 15~18 / 21~24 (한국시간)"
+        )
+
+    # 현재 세션이 아직 자동 생성되지 않았다면 DB에서 비밀번호를 만들고
+    # 메모리 세션도 맞춰준다. Discord 패널 자체는 이 명령어로 1개만 보낸다.
+    global current_password, current_date, current_slot
+
+    session_row = await run_db(load_active_session)
+    if session_row and session_row[0] == period["date"] and session_row[1] == period["slot"]:
+        password = session_row[2]
+    else:
+        password = generate_password()
+        await run_db(save_session, period["date"], period["slot"], password)
+
+    current_password = password
+    current_date = period["date"]
+    current_slot = period["slot"]
+
+    await ctx.send(
+        f"📢 **현재 출석창**\n"
+        f"🕒 출석 시간: **{period['start'].strftime('%H:%M')}**\n"
+        f"⏰ 출석 가능시간: **{period['start'].strftime('%H:%M')} ~ {period['end'].strftime('%H:%M')}**\n"
+        f"📊 집계시간: **{period['aggregate_start'].strftime('%H:%M')} ~ {period['aggregate_end'].strftime('%H:%M')}**\n"
+        "아래 버튼을 눌러 출석해주세요.\n"
+        "출석 시 **1점**이 지급됩니다.",
+        view=AttendanceView()
+    )
+
+
 @bot.command(name="가산점")
 async def bonus_command(ctx):
     # 가산점은 이 명령어를 입력했을 때만 생성/표시된다.
-    # 자동 출석 루프에서는 가산점 세션을 절대 생성하지 않는다.
+    # 자동 출석 루프에서는 가산점 세션을 생성하지 않는다.
+    # 현재 출석 시간대에서 1~5점 중 하나를 선택하며, 같은 시간대에는 1회만 생성한다.
     if not is_admin_channel(ctx):
         return await ctx.send(
             "❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다."
@@ -2475,11 +2576,10 @@ async def on_ready():
     print(
         f"관리자채널: {ADMIN_CHANNEL_ID}"
     )
-    print(
-        f"테스트모드: {TEST_MODE}, "
-        f"출석패널 주기: {TEST_INTERVAL_MINUTES}분"
-    )
-    print("가산점 기능: !가산점 / 1~5점 / 유효시간 1시간")
+    print("운영모드: 한국시간 03:00 / 09:00 / 15:00 / 21:00")
+    print("출석 가능시간: 03~06 / 09~12 / 15~18 / 21~24")
+    print("출석 집계시간: 00~06 / 06~12 / 12~18 / 18~24")
+    print("가산점 기능: !가산점 / 1~5점 / 동일 6시간 구간 1회")
     print(f"Google Sheets 연동: {'ON' if GOOGLE_SHEETS_URL and GOOGLE_SHEETS_SECRET else 'OFF'}")
 
 
