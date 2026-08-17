@@ -7,9 +7,6 @@ import os
 import asyncio
 import random
 import string
-import json
-import urllib.request
-import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -17,6 +14,8 @@ from discord.ext import commands, tasks
 import psycopg2
 from flask import Flask
 from threading import Thread
+import json
+from urllib.request import Request, urlopen
 
 # =====================================================
 # 🔹 설정
@@ -31,7 +30,6 @@ ADMIN_CHANNEL_ID = 1538446527968706691
 
 # 출석 패널 / 비밀번호 생성 시간
 # 테스트 모드: 2분마다 새로운 출석 세션 생성
-# 실제 운영 전환 시 TEST_MODE = False
 TEST_MODE = True
 TEST_INTERVAL_MINUTES = 2
 
@@ -56,75 +54,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL 환경변수 없음")
 
-# =====================================================
-# 🔹 Google Sheets 연동
-# =====================================================
-# Render 환경변수
-# GOOGLE_SHEETS_URL    = Apps Script 웹 앱 /exec 주소
-# GOOGLE_SHEETS_SECRET = Apps Script의 SECRET_KEY와 동일한 값
-GOOGLE_SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL", "").strip()
-GOOGLE_SHEETS_SECRET = os.getenv("GOOGLE_SHEETS_SECRET", "").strip()
-
-
-def send_to_google_sheet(date_text, time_text, record_type, user_id, username, points):
-    """출석/가산점을 Apps Script를 통해 Google Sheets에 기록합니다."""
-    if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
-        print("[Google Sheets] 환경변수가 없어 기록을 건너뜁니다.")
-        return False
-
-    payload = {
-        "secret": GOOGLE_SHEETS_SECRET,
-        "date": str(date_text),
-        "time": str(time_text),
-        "type": str(record_type),
-        "user_id": str(user_id),
-        "username": str(username),
-        "points": int(points),
-    }
-
-    try:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            GOOGLE_SHEETS_URL,
-            data=body,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-
-        with urllib.request.urlopen(request, timeout=10) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
-
-        try:
-            result = json.loads(response_text)
-        except Exception:
-            result = {}
-
-        if result.get("success") is False:
-            print(f"[Google Sheets] 기록 실패: {response_text}")
-            return False
-
-        print(
-            f"[Google Sheets] 기록 성공: "
-            f"{record_type} / {username} / +{points}점 / {response_text}"
-        )
-        return True
-
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(e)
-        print(f"[Google Sheets] HTTP 오류 {e.code}: {detail}")
-        return False
-
-    except urllib.error.URLError as e:
-        print(f"[Google Sheets] 연결 오류: {e}")
-        return False
-
-    except Exception as e:
-        print(f"[Google Sheets] 전송 오류: {type(e).__name__}: {e}")
-        return False
-
 
 def get_db_connection():
     return psycopg2.connect(
@@ -143,6 +72,27 @@ def release_db_connection(conn):
 async def run_db(func, *args):
     """동기 psycopg2 작업을 별도 스레드에서 실행해 Discord 이벤트 루프를 막지 않음."""
     return await asyncio.to_thread(func, *args)
+
+
+# =====================================================
+# 🔹 Google Sheets 연동
+# =====================================================
+GOOGLE_SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL", "").strip()
+GOOGLE_SHEETS_SECRET = os.getenv("GOOGLE_SHEETS_SECRET", "").strip()
+
+def send_to_google_sheet(date_text, time_text, record_type, user_id, username, points):
+    if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
+        return False
+    payload={"secret":GOOGLE_SHEETS_SECRET,"date":str(date_text),"time":str(time_text),"type":str(record_type),"user_id":str(user_id),"username":str(username),"points":int(points)}
+    try:
+        body=json.dumps(payload,ensure_ascii=False).encode("utf-8")
+        req=Request(GOOGLE_SHEETS_URL,data=body,headers={"Content-Type":"application/json"},method="POST")
+        with urlopen(req,timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        print(f"[Google Sheets 전송 오류] {type(e).__name__}: {e}")
+        return False
 
 
 # =====================================================
@@ -187,6 +137,8 @@ bonus_created_at = None
 bonus_message_ids = set()
 boss_names = []
 boss_panel_message_id = None
+attendance_panel_message_id = None
+admin_password_message_id = None
 
 
 def get_current_slot(hour=None):
@@ -198,24 +150,6 @@ def get_current_slot(hour=None):
 
 def generate_password():
     return "".join(random.choices(string.digits, k=4))
-
-
-def get_test_session_start(now=None):
-    """테스트 모드에서 2분 단위로 고정된 세션 시작 시각을 반환합니다."""
-    if now is None:
-        now = datetime.now(KST)
-
-    bucket_minute = (now.minute // TEST_INTERVAL_MINUTES) * TEST_INTERVAL_MINUTES
-
-    return now.replace(
-        minute=bucket_minute,
-        second=0,
-        microsecond=0
-    )
-
-
-def get_test_session_slot(now=None):
-    return get_test_session_start(now).strftime("%H%M")
 
 
 def get_current_session():
@@ -371,7 +305,7 @@ def load_active_session():
 
         try:
             if TEST_MODE:
-                # 테스트 모드의 세션은 HHMM 형식 (2분 단위, 예: 2238)
+                # 테스트 모드의 세션은 HHMM 형식 (예: 2238)
                 if len(str(slot_text)) != 4:
                     return None
                 session_hour = int(str(slot_text)[:2])
@@ -655,46 +589,20 @@ def save_boss_drop_db(boss_name, drop_name, user_id, username):
 
 async def send_boss_panel():
     global boss_panel_message_id
-
-    # 출석 비밀번호가 올라오는 관리자 채팅방에 표시
-    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
-    if admin_channel is None:
-        print(f"[보스 패널 오류] 관리자 채널을 찾을 수 없습니다: {ADMIN_CHANNEL_ID}")
-        return
-
-    # DB에 현재 등록된 전체 보스 목록을 다시 읽는다.
-    # 메모리 목록이 누락되었더라도 관리자방에는 DB 기준 전체 보스가 표시된다.
+    admin_channel=bot.get_channel(ADMIN_CHANNEL_ID)
+    if admin_channel is None: return
     try:
-        current_bosses = await run_db(load_bosses)
-        boss_names[:] = current_bosses
+        current_bosses=await run_db(load_bosses); boss_names[:]=current_bosses
     except Exception as e:
-        print(f"[보스 목록 로드 오류] {type(e).__name__}: {e}")
-        current_bosses = list(boss_names)
-
-    # 기존 보스 패널 메시지가 있으면 갱신을 위해 삭제
+        print(f"[보스 목록 로드 오류] {type(e).__name__}: {e}"); current_bosses=list(boss_names)
+    if not current_bosses: return
+    content=("👹 **보스 목록**\n현재 등록된 보스입니다.\n보스를 처치한 후 해당 보스의 빨간 버튼을 눌러 득템 이름을 입력하세요.")
+    view=BossPanelView()
     if boss_panel_message_id:
         try:
-            old = await admin_channel.fetch_message(boss_panel_message_id)
-            await old.delete()
-        except Exception:
-            pass
-        boss_panel_message_id = None
-
-    # 등록된 보스가 하나도 없으면 패널을 만들지 않는다.
-    if not current_bosses:
-        return
-
-    # 현재 등록된 '전체' 보스를 빨간 버튼으로 생성
-    view = BossPanelView()
-
-    msg = await admin_channel.send(
-        "👹 **보스 목록**\n"
-        "현재 등록된 보스입니다.\n"
-        "보스를 처치한 후 해당 보스의 빨간 버튼을 눌러 득템 이름을 입력하세요.",
-        view=view
-    )
-    boss_panel_message_id = msg.id
-
+            old=await admin_channel.fetch_message(boss_panel_message_id); await old.edit(content=content,view=view); return
+        except Exception: boss_panel_message_id=None
+    msg=await admin_channel.send(content,view=view); boss_panel_message_id=msg.id
 
 
 
@@ -1097,17 +1005,7 @@ class BonusPasswordModal(
                     ephemeral=True
                 )
 
-            # DB 저장 성공 후 Google Sheets에도 기록
-            now_text = datetime.now(KST).strftime("%H:%M:%S")
-            await run_db(
-                send_to_google_sheet,
-                bonus_date,
-                now_text,
-                "가산점",
-                user_id,
-                username,
-                bonus_points
-            )
+            await run_db(send_to_google_sheet, bonus_date, now.strftime("%H:%M:%S"), "가산점", user_id, username, bonus_points)
 
             await interaction.followup.send(
                 f"🔵 **가산점 +{bonus_points}점 지급 완료!**\n"
@@ -1415,17 +1313,7 @@ class AttendancePasswordModal(
                     ephemeral=True
                 )
 
-            # DB 저장 성공 후 Google Sheets에도 기록
-            now_text = datetime.now(KST).strftime("%H:%M:%S")
-            await run_db(
-                send_to_google_sheet,
-                current_date,
-                now_text,
-                "출석",
-                user_id,
-                username,
-                1
-            )
+            await run_db(send_to_google_sheet, current_date, now.strftime("%H:%M:%S"), "출석", user_id, username, 1)
 
             await interaction.followup.send(
                 f"✅ 출석 완료!\n"
@@ -1501,116 +1389,42 @@ async def clear_both_channels():
 # =====================================================
 @tasks.loop(minutes=1)
 async def automatic_attendance_panel():
-
-    global current_password
-    global current_date
-    global current_slot
-    global last_panel_key
-
-    now = datetime.now(KST)
-
-    date_text = now.strftime("%Y-%m-%d")
-
+    global current_password,current_date,current_slot,last_panel_key
+    global attendance_panel_message_id,admin_password_message_id
+    now=datetime.now(KST); date_text=now.strftime("%Y-%m-%d")
     if TEST_MODE:
-        # 테스트 모드에서는 2분마다 별도의 출석 세션을 사용합니다.
-        # 예: 22:00~22:01 = 2200 세션
-        #     22:02~22:03 = 2202 세션
-        slot_text = get_test_session_slot(now)
-        panel_key = f"{date_text}_{slot_text}"
+        bucket=(now.minute//TEST_INTERVAL_MINUTES)*TEST_INTERVAL_MINUTES
+        slot_text=f"{now.hour:02d}{bucket:02d}"; panel_key=f"{date_text}_{slot_text}"
     else:
-        # 운영 모드: 03:00 / 09:00 / 15:00 / 21:00
-        if now.hour not in ATTENDANCE_HOURS:
-            return
-
-        if now.minute != 0:
-            return
-
-        slot_text = get_current_slot(now.hour)
-        panel_key = f"{date_text}_{slot_text}"
-
-    # 재실행/루프 중복 방지
-    if last_panel_key == panel_key:
-        return
-
-    attendance_channel = bot.get_channel(
-        ATTENDANCE_CHANNEL_ID
-    )
-
-    admin_channel = bot.get_channel(
-        ADMIN_CHANNEL_ID
-    )
-
-    if not attendance_channel:
-        print(
-            f"[자동 패널 실패] 출석 채널 없음: "
-            f"{ATTENDANCE_CHANNEL_ID}"
-        )
-        return
-
-    if not admin_channel:
-        print(
-            f"[자동 패널 실패] 관리자 채널 없음: "
-            f"{ADMIN_CHANNEL_ID}"
-        )
-        return
-
-    password = generate_password()
-
-    current_password = password
-    current_date = date_text
-    current_slot = slot_text
-
-    # 비밀번호를 DB에도 저장해 봇 재시작 시 복구 가능하게 함
-    save_session(
-        date_text,
-        slot_text,
-        password
-    )
-
+        if now.hour not in ATTENDANCE_HOURS or now.minute!=0: return
+        slot_text=get_current_slot(now.hour); panel_key=f"{date_text}_{slot_text}"
+    if last_panel_key==panel_key: return
+    attendance_channel=bot.get_channel(ATTENDANCE_CHANNEL_ID); admin_channel=bot.get_channel(ADMIN_CHANNEL_ID)
+    if not attendance_channel or not admin_channel:
+        print("[자동 패널 실패] 출석/관리자 채널을 찾을 수 없습니다."); return
+    password=generate_password(); current_password=password; current_date=date_text; current_slot=slot_text
+    await run_db(save_session,date_text,slot_text,password)
+    validity=f"{TEST_INTERVAL_MINUTES}분" if TEST_MODE else "3시간"
+    attendance_content=(f"📢 **출석 시간입니다!**\n🕒 {now.strftime('%H:%M:%S')} 출석\n\n아래 버튼을 눌러 출석해주세요.\n출석 시 **1점**이 지급됩니다.\n⏰ 유효시간: {validity}")
+    admin_content=(f"🔐 **출석 비밀번호**\n\n```{password}```\n\n🕒 출석 시간: {now.strftime('%H:%M:%S')}\n⏰ 유효시간: {validity}\n⚠️ 이 번호는 혈맹원에게 알려주세요.")
     try:
-        # 테스트 모드에서는 새 2분 세션을 만들기 전에 이전 패널/비밀번호를 삭제한다.
-        # 같은 세션 동안에는 panel_key가 같으므로 비밀번호가 유지된다.
-        if TEST_MODE:
-            await clear_both_channels()
-
-        # 일반 출석창
-        validity_text = f"{TEST_INTERVAL_MINUTES}분" if TEST_MODE else "3시간"
-
-        # 여기서는 출석 패널만 생성한다.
-        # 가산점은 !가산점 명령어로 생성된 활성 세션이 있을 때만
-        # AttendanceView에 파란색 버튼으로 표시된다.
-        await attendance_channel.send(
-            f"📢 **출석 시간입니다!**\n"
-            f"🕒 {now.strftime('%H:%M:%S')} 출석\n\n"
-            f"아래 버튼을 눌러 출석해주세요.\n"
-            f"출석 시 **1점**이 지급됩니다.\n"
-            f"⏰ 유효시간: {validity_text}",
-            view=AttendanceView()
-        )
-
-        # 관리자 전용방
-        await admin_channel.send(
-            f"🔐 **출석 비밀번호**\n\n"
-            f"```{password}```\n\n"
-            f"🕒 출석 시간: {now.strftime('%H:%M:%S')}\n"
-            f"⏰ 유효시간: {validity_text}\n"
-            f"⚠️ 이 번호는 혈맹원에게 알려주세요."
-        )
-
-        # 출석 비밀번호가 생성될 때마다 관리자방에
-        # 현재 DB에 등록된 전체 보스 버튼을 표시한다.
-        await send_boss_panel()
-
-        last_panel_key = panel_key
-
-        print(
-            f"[자동 출석] {date_text} "
-            f"[세션 {slot_text}] "
-            f"비밀번호={password}"
-        )
-
+        if attendance_panel_message_id:
+            try:
+                msg=await attendance_channel.fetch_message(attendance_panel_message_id); await msg.edit(content=attendance_content,view=AttendanceView())
+            except Exception: attendance_panel_message_id=None
+        if attendance_panel_message_id is None:
+            msg=await attendance_channel.send(attendance_content,view=AttendanceView()); attendance_panel_message_id=msg.id
+        if admin_password_message_id:
+            try:
+                msg=await admin_channel.fetch_message(admin_password_message_id); await msg.edit(content=admin_content)
+            except Exception: admin_password_message_id=None
+        if admin_password_message_id is None:
+            msg=await admin_channel.send(admin_content); admin_password_message_id=msg.id
+        last_panel_key=panel_key
+        print(f"[자동 출석] {date_text} [{slot_text}] 비밀번호={password} / 유효시간={validity}")
     except Exception as e:
-        print(f"[자동 출석 패널 오류] {e}")
+        print(f"[자동 출석 패널 오류] {type(e).__name__}: {e}")
+
 
 
 # =====================================================
@@ -1622,7 +1436,7 @@ async def automatic_channel_cleanup():
     now = datetime.now(KST)
 
     if TEST_MODE:
-        # 출석 패널은 2분마다 automatic_attendance_panel이 교체한다.
+        # 출석 패널은 1분마다 automatic_attendance_panel이 교체한다.
         # 가산점은 별도 생성이므로 생성 후 1시간 동안 유지한다.
         global bonus_password
         global bonus_date
@@ -1801,6 +1615,8 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             bonus_created_at = None
             boss_names.clear()
             boss_panel_message_id = None
+            attendance_panel_message_id = None
+            admin_password_message_id = None
 
             # DB 초기화 시 일반 출석창의 가산점 패널도 제거
             attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
@@ -2467,6 +2283,11 @@ async def on_ready():
         print(f"[보스 목록 로드 오류] {e}")
         boss_names.clear()
 
+
+    try:
+        await send_boss_panel()
+    except Exception as e:
+        print(f"[초기 보스 패널 오류] {type(e).__name__}: {e}")
 
     if not automatic_attendance_panel.is_running():
         automatic_attendance_panel.start()
