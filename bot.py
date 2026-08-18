@@ -302,31 +302,47 @@ def get_active_attendance_session(now=None):
       03시 세션: 03:00~09:00
       09시 세션: 09:00~15:00
       15시 세션: 15:00~21:00
-      21시 세션: 21:00~03:00
+      21시 세션: 21:00~03:00 (다음날)
 
-    반환값: (date_text, slot_text, session_start) 또는 None
+    자정 이후 00:00~02:59에는 '오늘 21시'가 아니라
+    '전날 21시' 세션을 찾아야 하므로 전날 날짜도 함께 검사합니다.
+
+    반환값: (세션 시작일자 YYYY-MM-DD, slot_text, session_start) 또는 None
     """
     if now is None:
         now = datetime.now(KST)
 
-    date_text = now.strftime("%Y-%m-%d")
+    # 오늘과 전날의 모든 세션 시작시각을 후보로 만듭니다.
+    candidate_starts = []
 
-    for start_hour in sorted(ATTENDANCE_HOURS, reverse=True):
-        if now.hour < start_hour:
-            continue
+    for day_offset in (0, -1):
+        base_date = (now + timedelta(days=day_offset)).date()
+        for start_hour in ATTENDANCE_HOURS:
+            session_start = datetime(
+                base_date.year,
+                base_date.month,
+                base_date.day,
+                start_hour,
+                0,
+                0,
+                tzinfo=KST
+            )
+            session_end = session_start + timedelta(hours=6)
 
-        session_start = now.replace(
-            hour=start_hour,
-            minute=0,
-            second=0,
-            microsecond=0
-        )
-        session_end = session_start + timedelta(hours=6)
+            if session_start <= now < session_end:
+                candidate_starts.append((session_start, f"{start_hour:02d}"))
 
-        if session_start <= now < session_end:
-            return date_text, f"{start_hour:02d}", session_start
+    if not candidate_starts:
+        return None
 
-    return None
+    # 겹치는 후보가 있을 경우 가장 최근에 시작한 세션을 사용합니다.
+    session_start, slot_text = max(
+        candidate_starts,
+        key=lambda item: item[0]
+    )
+
+    session_date = session_start.strftime("%Y-%m-%d")
+    return session_date, slot_text, session_start
 
 
 # =====================================================
