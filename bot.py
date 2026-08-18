@@ -232,6 +232,7 @@ current_password = None
 current_date = None
 current_slot = None
 last_panel_key = None
+last_cleanup_key = None
 
 # =====================================================
 # 🔹 현재 가산점 세션
@@ -1958,11 +1959,18 @@ async def automatic_channel_cleanup():
     if now.hour not in cleanup_hours:
         return
 
-    # 정각의 첫 1분 안에 한 번만 실행합니다.
+    # 10초 루프이므로 정각 1분 동안 여러 번 실행되지 않도록
+    # 날짜+시간 기준으로 1회만 실행합니다.
     if now.minute > 0:
         return
 
+    global last_cleanup_key
+    cleanup_key = now.strftime("%Y-%m-%d_%H")
+    if last_cleanup_key == cleanup_key:
+        return
+
     await clear_both_channels()
+    last_cleanup_key = cleanup_key
 
     print(
         f"[자동 채널 초기화] "
@@ -2625,8 +2633,11 @@ class PeriodQueryStartView(discord.ui.View):
 
 @bot.command(name="출석")
 async def attendance_command(ctx):
-    """현재 KST 출석 시간대의 출석 버튼을 다시 표시합니다."""
-    global current_date, current_slot, current_password
+    """관리자방에서 현재 출석 시간대의 출석 패널을 수동으로 표시합니다."""
+    global current_date, current_slot, current_password, last_panel_key
+
+    if not is_admin_channel(ctx):
+        return await ctx.send("❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다.")
 
     active_session = get_active_attendance_session()
 
@@ -2703,14 +2714,58 @@ async def attendance_command(ctx):
             "잠시 후 다시 `!출석`을 입력해주세요."
         )
 
-    await ctx.send(
+    # !출석은 관리자 명령어방에서 실행되지만, 실제 출석 버튼은
+    # 일반 혈맹 출석채널에 표시합니다.
+    attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+
+    if attendance_channel is None or admin_channel is None:
+        return await ctx.send("❌ 출석 또는 관리자 채널을 찾을 수 없습니다.")
+
+    validity_text = "3시간"
+    await attendance_channel.send(
         f"📢 **{slot_text}시 출석 패널**\n"
         f"🕒 출석 가능시간: **{slot_text}:00 ~ "
         f"{(int(slot_text) + 3) % 24:02d}:00**\n"
         "아래 버튼을 눌러 출석해주세요.\n"
-        "⭐ 출석 시 **1점**",
+        "⭐ 출석 시 **1점**\n"
+        f"⏰ 유효시간: {validity_text}",
         view=AttendanceView()
     )
+
+    # 관리자방에는 비밀번호를 표시하고, 같은 관리자방에 현재 보스 패널도 함께 표시합니다.
+    await admin_channel.send(
+        f"🔐 **출석 비밀번호**\n\n"
+        f"```{current_password}```\n\n"
+        f"🕒 출석 시간: {datetime.now(KST).strftime('%H:%M:%S')}\n"
+        f"⏰ 유효시간: {validity_text}\n"
+        "⚠️ 이 번호는 혈맹원에게 알려주세요."
+    )
+
+    await send_boss_panel()
+
+    # 수동으로 패널을 띄웠으면 자동 루프가 같은 세션의 패널을 한 번 더 만들지 않도록
+    # DB의 panel_sent를 TRUE로 기록합니다.
+    def mark_manual_panel_sent():
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE attendance_sessions
+                    SET panel_sent=TRUE
+                    WHERE date=%s AND time_slot=%s
+                """, (date_text, slot_text))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            release_db_connection(conn)
+
+    await run_db(mark_manual_panel_sent)
+    last_panel_key = f"{date_text}_{slot_text}"
+
+    await ctx.send("✅ 일반 혈맹 출석창에 출석 패널을 표시했습니다. 관리자방에는 비밀번호와 보스 패널을 표시했습니다.")
 
 
 @bot.command(name="기간조회")
