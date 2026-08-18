@@ -47,7 +47,7 @@ DB_CONCURRENCY = 10
 GOOGLE_SHEETS_MIN_INTERVAL = 1.0
 GOOGLE_SHEETS_IDLE_POLL = 5.0
 
-# 실제 운영 시간: 03:00 / 09:00 / 15:00 / 21:00
+# 실제 운영 시간: 03:00 / 09:00 / 15:00 / 21:00 (각 6시간)
 ATTENDANCE_HOURS = {3, 9, 15, 21}
 
 # =====================================================
@@ -321,7 +321,7 @@ def get_active_attendance_session(now=None):
             second=0,
             microsecond=0
         )
-        session_end = session_start + timedelta(hours=3)
+        session_end = session_start + timedelta(hours=6)
 
         if session_start <= now < session_end:
             return date_text, f"{start_hour:02d}", session_start
@@ -550,7 +550,7 @@ def load_active_session():
         session_duration = (
             timedelta(minutes=TEST_INTERVAL_MINUTES)
             if TEST_MODE
-            else timedelta(hours=3)
+            else timedelta(hours=6)
         )
 
         if session_start <= now < session_start + session_duration:
@@ -1129,9 +1129,10 @@ class DropDeleteSelect(discord.ui.Select):
         self.drops = drops
 
         options = []
-        for row in drops[:25]:
+        for index, row in enumerate(drops[:25], start=1):
             drop_id, boss_name, drop_name, username, created_at = row
-            label = f"{drop_name} - {boss_name}"[:100]
+            # !득템 목록에서 보이는 순번과 동일하게 표시합니다.
+            label = f"{index}️⃣ {drop_name} - {boss_name}"[:100]
             desc = (
                 f"{username} / "
                 f"{created_at.strftime('%m-%d %H:%M') if created_at else ''}"
@@ -1718,7 +1719,7 @@ class AttendancePasswordModal(
             session_duration = (
                 timedelta(minutes=TEST_INTERVAL_MINUTES)
                 if TEST_MODE
-                else timedelta(hours=3)
+                else timedelta(hours=6)
             )
 
             if now < session_start or now >= session_start + session_duration:
@@ -1849,7 +1850,7 @@ async def automatic_attendance_panel():
         if active_session is None:
             return
         date_text, slot_text, session_start = active_session
-        session_end = session_start + timedelta(hours=3)
+        session_end = session_start + timedelta(hours=6)
 
     # DB에서 해당 시간대 세션을 먼저 확인합니다.
     def load_session_with_panel():
@@ -2768,7 +2769,7 @@ async def attendance_command(ctx):
     await ctx.send(
         f"📢 **{slot_text}시 출석 패널**\n"
         f"🕒 출석 가능시간: **{slot_text}:00 ~ "
-        f"{(int(slot_text) + 3) % 24:02d}:00**\n"
+        f"{(int(slot_text) + 6) % 24:02d}:00**\n"
         "아래 버튼을 눌러 출석해주세요.\n"
         "⭐ 출석 시 **1점**",
         view=AttendanceView()
@@ -2933,7 +2934,7 @@ async def on_ready():
         f"테스트모드: {TEST_MODE} / "
         f"운영 시간: 03:00, 09:00, 15:00, 21:00 (KST)"
     )
-    print("출석 가능시간: 각 시작 시각부터 3시간")
+    print("출석 가능시간: 각 시작 시각부터 6시간")
     print("가산점: 동일 출석 시간대 1회 / 유효시간 3시간")
     print("수동 출석: !출석")
 
