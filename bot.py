@@ -1429,12 +1429,8 @@ class BonusPasswordModal(
                     ephemeral=True
                 )
 
-            # DB timestamp는 timezone 정보가 없는 경우가 있으므로 KST 기준으로 처리합니다.
-            if created_at is not None:
-                if created_at.tzinfo is None:
-                    created_at_kst = created_at.replace(tzinfo=KST)
-                else:
-                    created_at_kst = created_at.astimezone(KST)
+            # created_at은 기록용입니다.
+            # 가산점 실제 사용 가능시간은 현재 출석 시간대(6시간) 기준으로 판단합니다.
 
                 if now >= created_at_kst + timedelta(hours=6):
                     return await interaction.followup.send(
@@ -1531,6 +1527,23 @@ class StandaloneBonusView(discord.ui.View):
         self.add_item(BonusButton())
 
 
+async def delete_message_after(message, delay_seconds=3600):
+    """지정 시간 후 Discord 메시지를 삭제합니다."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            print("[가산점 메시지 자동삭제 실패] Discord 권한 부족")
+        except discord.HTTPException as e:
+            print(f"[가산점 메시지 자동삭제 실패] HTTP 오류: {e}")
+        except Exception as e:
+            print(f"[가산점 메시지 자동삭제 오류] {type(e).__name__}: {e}")
+    except asyncio.CancelledError:
+        raise
+
 class BonusPointButton(discord.ui.Button):
     def __init__(self, points):
         super().__init__(
@@ -1576,13 +1589,54 @@ class BonusPointButton(discord.ui.Button):
             )
 
             if not inserted:
+                # 같은 시간대의 가산점이 이미 있으면 새 세션을 만들지 않고
+                # 기존 비밀번호/점수로 관리자방과 일반 혈맹창에 다시 표시합니다.
+                # 단, 현재 출석 시간대가 끝나기 전(예: 21시 세션이면 03:00 전)이어야 합니다.
                 existing_points = int(bonus_session[3]) if bonus_session else 0
-                return await interaction.response.send_message(
-                    f"⚠️ **{slot_text}시 시간대 가산점**이 이미 생성되어 있습니다.\n"
-                    f"현재 가산점: **+{existing_points}점**\n"
-                    "같은 시간대에는 가산점을 다시 생성할 수 없습니다.",
-                    ephemeral=True
+                existing_password = str(bonus_session[4]) if bonus_session else ""
+
+                bonus_password = existing_password
+                bonus_date = date_text
+                bonus_slot = slot_text
+                bonus_points = existing_points
+                bonus_created_at = (
+                    bonus_session[5]
+                    if bonus_session and bonus_session[5] is not None
+                    else now
                 )
+
+                await interaction.response.send_message(
+                    f"🔵 **가산점 +{existing_points}점**\n\n"
+                    f"🔐 가산점 비밀번호\n"
+                    f"```{existing_password}```\n\n"
+                    "⏰ 메시지/버튼 유지시간: 1시간"
+                )
+                admin_bonus_message = await interaction.original_response()
+                asyncio.create_task(
+                    delete_message_after(admin_bonus_message, 3600)
+                )
+
+                attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+                if attendance_channel is not None:
+                    bonus_message = await attendance_channel.send(
+                        "🔵 **가산점 패널**\n"
+                        f"⭐ 현재 가산점: **+{existing_points}점**\n"
+                        "아래 파란색 버튼을 눌러 가산점 비밀번호를 입력하세요.\n"
+                        "⏰ 메시지/버튼 유지시간: 1시간",
+                        view=StandaloneBonusView()
+                    )
+                    bonus_message_ids.add(bonus_message.id)
+                    await run_db(
+                        update_bonus_message_id,
+                        date_text,
+                        slot_text,
+                        bonus_message.id
+                    )
+                    asyncio.create_task(
+                        delete_message_after(bonus_message, 3600)
+                    )
+
+                return
 
             # 메모리 변수는 화면 표시용 캐시일 뿐, 실제 인증 기준은 DB입니다.
             bonus_password = password
@@ -1591,30 +1645,40 @@ class BonusPointButton(discord.ui.Button):
             bonus_points = self.points
             bonus_created_at = now
 
-            # 관리자방에는 비밀번호만 생성하고,
-            # 일반 출석창에는 출석 패널과 별개인 가산점 버튼을 즉시 전송한다.
+            # 관리자방에는 비밀번호를 표시하고 1시간 후 삭제합니다.
+            # 일반 혈맹창 가산점 버튼도 1시간 후 삭제합니다.
             await interaction.response.send_message(
                 f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
                 f"```{password}```\n\n"
-                f"⏰ 유효시간: 3시간",
-                ephemeral=False
+                "⏰ 메시지/버튼 유지시간: 1시간"
+            )
+            admin_bonus_message = await interaction.original_response()
+            asyncio.create_task(
+                delete_message_after(admin_bonus_message, 3600)
             )
 
             attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
 
             if attendance_channel is not None:
-                # 기존 출석 패널/메시지는 건드리지 않고
-                # 가산점 패널만 새 메시지로 추가한다.
                 bonus_message = await attendance_channel.send(
                     "🔵 **가산점 패널**\n"
                     f"⭐ 현재 가산점: **+{self.points}점**\n"
                     "아래 파란색 버튼을 눌러 가산점 비밀번호를 입력하세요.\n"
-                    "⏰ 유효시간: 3시간",
+                    "⏰ 메시지/버튼 유지시간: 1시간",
                     view=StandaloneBonusView()
                 )
                 bonus_message_ids.add(bonus_message.id)
-                await run_db(update_bonus_message_id, date_text, slot_text, bonus_message.id)
+                await run_db(
+                    update_bonus_message_id,
+                    date_text,
+                    slot_text,
+                    bonus_message.id
+                )
+                asyncio.create_task(
+                    delete_message_after(bonus_message, 3600)
+                )
+
 
         except Exception as e:
             print(
@@ -2788,7 +2852,7 @@ async def attendance_command(ctx):
             f"{(int(slot_text) + 6) % 24:02d}:00**\n"
             "아래 버튼을 눌러 출석해주세요.\n"
             "⭐ 출석 시 **1점**\n"
-            "⏰ 유효시간: 6시간",
+            "⏰ 메시지/버튼 유지시간: 1시간",
             view=AttendanceView()
         )
 
@@ -2796,7 +2860,7 @@ async def attendance_command(ctx):
             f"🔐 **출석 비밀번호**\n\n"
             f"```{current_password}```\n\n"
             f"🕒 출석 시간: {now.strftime('%H:%M:%S')}\n"
-            "⏰ 유효시간: 6시간\n"
+            "⏰ 메시지/버튼 유지시간: 1시간\n"
             "⚠️ 이 번호는 혈맹원에게 알려주세요."
         )
 
@@ -2993,7 +3057,7 @@ async def on_ready():
         f"운영 시간: 03:00, 09:00, 15:00, 21:00 (KST)"
     )
     print("출석 가능시간: 각 시작 시각부터 6시간")
-    print("가산점: 동일 출석 시간대 1회 / 유효시간 6시간")
+    print("가산점: 동일 출석 시간대 1회 / 메시지·버튼 1시간")
     print("수동 출석: !출석")
 
 
