@@ -10,6 +10,7 @@ import string
 import json
 import urllib.request
 import urllib.error
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -256,6 +257,15 @@ bonus_created_at = None
 bonus_message_ids = set()
 boss_names = []
 boss_panel_message_id = None
+
+# =====================================================
+# 🔹 Discord Gateway 상태 감시
+# =====================================================
+gateway_disconnected_at = None
+gateway_last_connected_at = None
+gateway_watchdog_task = None
+GATEWAY_WATCHDOG_INTERVAL = 15
+GATEWAY_MAX_DISCONNECT_SECONDS = 300  # 5분
 
 
 def get_current_slot(hour=None):
@@ -3035,6 +3045,89 @@ async def on_command_error(ctx, error):
 
 
 # =====================================================
+# 🔹 Discord Gateway 감시
+# =====================================================
+@bot.event
+async def on_connect():
+    global gateway_last_connected_at
+    gateway_last_connected_at = datetime.now(KST)
+    print(
+        f"[DISCORD] Gateway 연결됨 "
+        f"({gateway_last_connected_at.strftime('%Y-%m-%d %H:%M:%S')})"
+    )
+
+
+@bot.event
+async def on_disconnect():
+    global gateway_disconnected_at
+    gateway_disconnected_at = datetime.now(KST)
+    print(
+        f"[DISCORD] Gateway 연결 끊김 "
+        f"({gateway_disconnected_at.strftime('%Y-%m-%d %H:%M:%S')})"
+    )
+
+
+@bot.event
+async def on_resumed():
+    global gateway_disconnected_at, gateway_last_connected_at
+    gateway_disconnected_at = None
+    gateway_last_connected_at = datetime.now(KST)
+    print(
+        f"[DISCORD] Gateway Resume 성공 "
+        f"({gateway_last_connected_at.strftime('%Y-%m-%d %H:%M:%S')})"
+    )
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"[DISCORD EVENT ERROR] event={event}")
+    traceback.print_exc()
+
+
+async def discord_gateway_watchdog():
+    """
+    Discord Gateway 연결 상태를 감시합니다.
+    일시적인 끊김은 discord.py의 자동 재연결에 맡기고,
+    5분 이상 disconnect 상태가 지속되면 프로세스를 종료하여
+    Render가 새 프로세스를 기동하도록 합니다.
+    """
+    while True:
+        try:
+            await asyncio.sleep(GATEWAY_WATCHDOG_INTERVAL)
+
+            global gateway_disconnected_at
+
+            if gateway_disconnected_at is None:
+                continue
+
+            elapsed = (
+                datetime.now(KST) - gateway_disconnected_at
+            ).total_seconds()
+
+            print(
+                f"[DISCORD WATCHDOG] Gateway 단절 "
+                f"{int(elapsed)}초 경과"
+            )
+
+            if elapsed >= GATEWAY_MAX_DISCONNECT_SECONDS:
+                print(
+                    "[DISCORD WATCHDOG] Gateway가 "
+                    f"{GATEWAY_MAX_DISCONNECT_SECONDS}초 이상 복구되지 않아 "
+                    "프로세스를 종료합니다. Render가 자동 재시작해야 합니다."
+                )
+                os._exit(1)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(
+                f"[DISCORD WATCHDOG ERROR] "
+                f"{type(e).__name__}: {e}"
+            )
+            await asyncio.sleep(5)
+
+
+# =====================================================
 # 🔹 봇 시작
 # =====================================================
 @bot.event
@@ -3064,6 +3157,12 @@ async def on_ready():
     global google_sheet_worker_task
     if google_sheet_worker_task is None or google_sheet_worker_task.done():
         google_sheet_worker_task = asyncio.create_task(google_sheet_sync_worker())
+
+    global gateway_watchdog_task
+    if gateway_watchdog_task is None or gateway_watchdog_task.done():
+        gateway_watchdog_task = asyncio.create_task(
+            discord_gateway_watchdog()
+        )
 
     print(f"로그인 완료: {bot.user}")
     print(
