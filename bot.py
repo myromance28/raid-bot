@@ -1436,7 +1436,7 @@ class BonusPasswordModal(
                 else:
                     created_at_kst = created_at.astimezone(KST)
 
-                if now >= created_at_kst + timedelta(hours=3):
+                if now >= created_at_kst + timedelta(hours=6):
                     return await interaction.followup.send(
                         "❌ 현재 출석 시간대의 가산점 유효시간이 종료되었습니다.",
                         ephemeral=True
@@ -1996,7 +1996,7 @@ async def automatic_channel_cleanup():
             else:
                 created_at = created_at.astimezone(KST)
 
-            if now >= created_at + timedelta(hours=3):
+            if now >= created_at + timedelta(hours=6):
                 message_id = bonus_session[6]
                 attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
 
@@ -2008,7 +2008,7 @@ async def automatic_channel_cleanup():
                         pass
 
                 await run_db(delete_bonus_session, date_text, slot_text)
-                print("[가산점 종료] 3시간이 지나 가산점 세션을 종료했습니다.")
+                print("[가산점 종료] 6시간이 지나 가산점 세션을 종료했습니다.")
 
         return
 
@@ -2993,7 +2993,7 @@ async def on_ready():
         f"운영 시간: 03:00, 09:00, 15:00, 21:00 (KST)"
     )
     print("출석 가능시간: 각 시작 시각부터 6시간")
-    print("가산점: 동일 출석 시간대 1회 / 유효시간 3시간")
+    print("가산점: 동일 출석 시간대 1회 / 유효시간 6시간")
     print("수동 출석: !출석")
 
 
