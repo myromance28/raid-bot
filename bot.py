@@ -1423,14 +1423,34 @@ class BonusPasswordModal(
             _, date_text, slot_text, bonus_points, stored_password, created_at, _ = bonus_session
             now = datetime.now(KST)
 
-            if date_text != now.strftime("%Y-%m-%d"):
+            # 현재 KST 시간대의 실제 출석 세션을 다시 계산합니다.
+            # 00:00~02:59에는 전날 21시 세션이므로 DB의 date와 오늘 날짜를
+            # 단순 비교하면 안 됩니다.
+            current_active_session = get_active_attendance_session(now)
+
+            if current_active_session is None:
+                return await interaction.followup.send(
+                    "❌ 현재 출석 시간대가 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            active_date, active_slot, active_session_start = current_active_session
+
+            if str(date_text) != str(active_date) or str(slot_text) != str(active_slot):
                 return await interaction.followup.send(
                     "❌ 현재 출석 시간대의 가산점이 아닙니다.",
                     ephemeral=True
                 )
 
-            # created_at은 기록용입니다.
-            # 가산점 실제 사용 가능시간은 현재 출석 시간대(6시간) 기준으로 판단합니다.
+            # 가산점 세션 자체는 해당 출석 시간대가 끝날 때까지 유효합니다.
+            if now >= active_session_start + timedelta(hours=6):
+                return await interaction.followup.send(
+                    "❌ 현재 출석 시간대가 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            # created_at은 메시지/버튼 표시 시간을 관리하는 용도의 기록값이며,
+            # 실제 가산점 사용 가능 시간은 위의 출석 세션 종료 시각으로 판정합니다.
 
                 if now >= created_at_kst + timedelta(hours=6):
                     return await interaction.followup.send(
