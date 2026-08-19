@@ -1794,7 +1794,7 @@ class SiegeAttendanceModal(
 class SiegeAttendanceButton(discord.ui.Button):
     def __init__(self, session_id):
         super().__init__(
-            label="공성전",
+            label="🟨 공성전",
             style=discord.ButtonStyle.secondary,
             custom_id=f"raid_siege_attendance_{int(session_id)}"
         )
@@ -2027,11 +2027,14 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
+        # DB 작업 전에 즉시 defer하여 Discord interaction timeout을 방지합니다.
+        await interaction.response.defer(ephemeral=True)
+
         now = datetime.now(KST)
         active_session = get_active_attendance_session(now)
 
         if active_session is None:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⚠️ 현재는 출석 시간대가 아닙니다.\n"
                 "출석 시간은 **03:00 / 09:00 / 15:00 / 21:00**입니다.",
                 ephemeral=True
@@ -2041,7 +2044,7 @@ class BonusPointButton(discord.ui.Button):
         password = generate_password()
 
         try:
-            # 호출할 때마다 새로운 세션 생성
+            # !가산점 호출마다 새로운 세션 생성
             bonus_session = await run_db(
                 save_bonus_session,
                 date_text,
@@ -2061,17 +2064,16 @@ class BonusPointButton(discord.ui.Button):
                 _
             ) = bonus_session
 
-            await interaction.response.send_message(
+            # 관리자에게 결과 전달
+            await interaction.followup.send(
                 f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
                 f"```{session_password}```\n\n"
-                "⏰ **이 호출은 1분 동안만 유효합니다.**"
+                "⏰ **이 호출은 1분 동안만 유효합니다.**",
+                ephemeral=True
             )
 
-            admin_bonus_message = await interaction.original_response()
-            asyncio.create_task(delete_message_after(admin_bonus_message, 60))
-            asyncio.create_task(expire_bonus_session_after(session_id, 60))
-
+            # 일반 혈맹방에 가산점 패널 생성
             attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
 
             if attendance_channel is not None:
@@ -2091,7 +2093,13 @@ class BonusPointButton(discord.ui.Button):
                     bonus_message.id
                 )
 
-                asyncio.create_task(delete_message_after(bonus_message, 60))
+                # 세션과 일반방 패널을 정확히 1분 후 종료
+                asyncio.create_task(
+                    expire_bonus_session_after(session_id, 60)
+                )
+                asyncio.create_task(
+                    delete_message_after(bonus_message, 60)
+                )
 
         except Exception as e:
             print(f"[가산점 생성 오류] {type(e).__name__}: {e}")
@@ -2685,7 +2693,7 @@ async def siege_command(ctx):
 
         attendance_message = await attendance_channel.send(
             "🏰 **공성전 출석**\n"
-            "공성전에 참여하신 분은 아래 **노란색 버튼**을 눌러 출석해주세요.\n"
+            "공성전에 참여하신 분은 아래 **🟨 공성전** 버튼을 눌러 출석해주세요.\n"
             "⏰ **호출 후 1시간 동안 유효합니다.**",
             view=SiegeAttendanceView(session_id)
         )
