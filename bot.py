@@ -38,6 +38,7 @@ TEST_MODE = False
 TEST_INTERVAL_MINUTES = 2  # 테스트 모드가 꺼져 있으므로 운영에는 사용되지 않음
 
 # 동시 출석 처리 / DB 연결 보호
+# 공성전/출석 동시 요청은 최대 10개의 DB 작업으로 제한합니다.
 # 150명 이상이 동시에 버튼을 눌러도 DB 연결을 무제한으로 만들지 않습니다.
 DB_POOL_MIN = 1
 DB_POOL_MAX = 10
@@ -415,6 +416,10 @@ def init_database():
                     password TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+            cursor.execute("""
+                ALTER TABLE siege_sessions
+                ADD COLUMN IF NOT EXISTS created_at_kst TEXT
             """)
 
             cursor.execute("""
@@ -903,12 +908,13 @@ def delete_bonus_session(session_id):
 def create_siege_session(date_text, password):
     conn = get_db_connection()
     try:
+        created_at_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO siege_sessions (date, password)
-                VALUES (%s, %s)
-                RETURNING id, date, password, created_at
-            """, (date_text, password))
+                INSERT INTO siege_sessions (date, password, created_at_kst)
+                VALUES (%s, %s, %s)
+                RETURNING id, date, password, created_at, created_at_kst
+            """, (date_text, password, created_at_kst))
             row = cursor.fetchone()
         conn.commit()
         return row
@@ -924,7 +930,7 @@ def load_siege_session(session_id):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, date, password, created_at
+                SELECT id, date, password, created_at, created_at_kst
                 FROM siege_sessions
                 WHERE id=%s
                 LIMIT 1
@@ -934,11 +940,56 @@ def load_siege_session(session_id):
         release_db_connection(conn)
 
 
-def save_siege_attendance(session_id, date_text, user_id, username):
-    """공성전 한 번의 호출에서는 사용자당 1회만 출석."""
+def save_siege_attendance_atomic(
+    session_id,
+    entered_password,
+    current_date_text,
+    user_id,
+    username
+):
+    """공성전 출석 1회 처리를 하나의 DB 트랜잭션으로 수행합니다."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, date, password, created_at_kst
+                FROM siege_sessions
+                WHERE id=%s
+                LIMIT 1
+            """, (int(session_id),))
+            session = cursor.fetchone()
+
+            if not session:
+                conn.rollback()
+                return "expired"
+
+            db_session_id, date_text, stored_password, created_at_kst_text = session
+
+            if str(date_text) != str(current_date_text):
+                conn.rollback()
+                return "date"
+
+            try:
+                created_at_kst = datetime.strptime(
+                    str(created_at_kst_text),
+                    "%Y-%m-%d %H:%M:%S.%f"
+                ).replace(tzinfo=KST)
+            except ValueError:
+                created_at_kst = datetime.strptime(
+                    str(created_at_kst_text),
+                    "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=KST)
+
+            now = datetime.now(KST)
+
+            if now >= created_at_kst + timedelta(hours=1):
+                conn.rollback()
+                return "expired"
+
+            if str(entered_password).strip() != str(stored_password):
+                conn.rollback()
+                return "password"
+
             cursor.execute("""
                 INSERT INTO siege_attendance
                     (siege_session_id, date, user_id, username)
@@ -947,27 +998,29 @@ def save_siege_attendance(session_id, date_text, user_id, username):
                 DO NOTHING
                 RETURNING id
             """, (
-                int(session_id),
+                int(db_session_id),
                 str(date_text),
                 int(user_id),
                 str(username)
             ))
-            row = cursor.fetchone()
-            inserted = row is not None
 
-            if inserted:
-                enqueue_google_sheet_record(
-                    cursor,
-                    date_text,
-                    datetime.now(KST).strftime("%H:%M:%S"),
-                    "공성출석",
-                    user_id,
-                    username,
-                    0
-                )
+            if cursor.fetchone() is None:
+                conn.rollback()
+                return "duplicate"
+
+            # 공성출석은 날짜/닉네임/출석만 필요하므로 time은 빈 값으로 큐에 저장합니다.
+            enqueue_google_sheet_record(
+                cursor,
+                date_text,
+                "",
+                "공성출석",
+                user_id,
+                username,
+                0
+            )
 
         conn.commit()
-        return inserted
+        return "success"
     except Exception:
         conn.rollback()
         raise
@@ -1680,54 +1733,38 @@ class SiegeAttendanceModal(
                 ephemeral=True
             )
 
+        # 150명이 동시에 제출해도 interaction timeout을 피하도록 즉시 defer.
         await interaction.response.defer(ephemeral=True)
 
         try:
-            session = await run_db(load_siege_session, self.session_id)
-            if not session:
-                return await interaction.followup.send(
-                    "❌ 이 공성전 출석 호출은 이미 종료되었습니다.",
-                    ephemeral=True
-                )
-
-            session_id, date_text, stored_password, created_at = session
-            now = datetime.now(KST)
-
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=KST)
-            else:
-                created_at = created_at.astimezone(KST)
-
-            if now >= created_at + timedelta(hours=1):
-                return await interaction.followup.send(
-                    "❌ 공성전 출석 가능시간 1시간이 종료되었습니다.",
-                    ephemeral=True
-                )
-
-            if str(self.password_input.value).strip() != str(stored_password):
-                return await interaction.followup.send(
-                    "❌ 공성전 비밀번호가 틀렸습니다.",
-                    ephemeral=True
-                )
-
-            inserted = await run_db(
-                save_siege_attendance,
-                session_id,
-                date_text,
+            result = await run_db(
+                save_siege_attendance_atomic,
+                self.session_id,
+                str(self.password_input.value).strip(),
+                datetime.now(KST).strftime("%Y-%m-%d"),
                 interaction.user.id,
                 interaction.user.display_name
             )
 
-            if not inserted:
+            if result == "success":
                 return await interaction.followup.send(
-                    "⚠️ 이미 이번 공성전 출석을 완료하셨습니다.",
+                    f"🏰 **공성전 출석 완료!**\n"
+                    f"👤 {interaction.user.display_name}\n"
+                    "✅ 출석",
                     ephemeral=True
                 )
 
-            await interaction.followup.send(
-                f"🏰 **공성전 출석 완료!**\n"
-                f"👤 {interaction.user.display_name}\n"
-                "✅ 출석",
+            if result == "password":
+                message = "❌ 공성전 비밀번호가 틀렸습니다."
+            elif result == "duplicate":
+                message = "⚠️ 이미 이번 공성전 출석을 완료하셨습니다."
+            elif result == "date":
+                message = "❌ 오늘 생성된 공성전 출석이 아닙니다."
+            else:
+                message = "❌ 공성전 출석 가능시간 1시간이 종료되었거나 세션이 없습니다."
+
+            return await interaction.followup.send(
+                message,
                 ephemeral=True
             )
 
@@ -1746,7 +1783,7 @@ class SiegeAttendanceButton(discord.ui.Button):
     def __init__(self, session_id):
         super().__init__(
             label="공성전",
-            style=discord.ButtonStyle.warning,
+            style=discord.ButtonStyle.secondary,
             custom_id=f"raid_siege_attendance_{int(session_id)}"
         )
         self.session_id = int(session_id)
@@ -2053,7 +2090,7 @@ class BonusPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
 
-        for points in range(1, 4):
+        for points in range(1, 11):
             self.add_item(BonusPointButton(points))
 
 
