@@ -840,7 +840,8 @@ def load_bonus_session(session_id):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, date, time_slot, points, password, created_at, message_id
+                SELECT id, date, time_slot, points, password,
+                       created_at, message_id, created_at_kst
                 FROM bonus_sessions
                 WHERE id=%s
                 LIMIT 1
@@ -854,16 +855,27 @@ def save_bonus_session(date_text, slot_text, points, password):
     """!가산점 호출마다 새로운 1분짜리 세션을 생성."""
     conn = get_db_connection()
     try:
+        created_at_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO bonus_sessions
-                    (date, time_slot, points, password)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id, date, time_slot, points, password, created_at, message_id
-            """, (date_text, slot_text, points, password))
+                    (date, time_slot, points, password, created_at_kst)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, date, time_slot, points, password,
+                          created_at, message_id, created_at_kst
+            """, (
+                date_text,
+                slot_text,
+                points,
+                password,
+                created_at_kst
+            ))
             row = cursor.fetchone()
+
         conn.commit()
         return row
+
     except Exception:
         conn.rollback()
         raise
@@ -1868,7 +1880,8 @@ class BonusPasswordModal(
                 bonus_points,
                 stored_password,
                 created_at,
-                _
+                _,
+                created_at_kst_text
             ) = bonus_session
 
             now = datetime.now(KST)
@@ -1888,11 +1901,16 @@ class BonusPasswordModal(
                     ephemeral=True
                 )
 
-            created_at_kst = created_at
-            if created_at_kst.tzinfo is None:
-                created_at_kst = created_at_kst.replace(tzinfo=KST)
-            else:
-                created_at_kst = created_at_kst.astimezone(KST)
+            try:
+                created_at_kst = datetime.strptime(
+                    str(created_at_kst_text),
+                    "%Y-%m-%d %H:%M:%S.%f"
+                ).replace(tzinfo=KST)
+            except ValueError:
+                created_at_kst = datetime.strptime(
+                    str(created_at_kst_text),
+                    "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=KST)
 
             if now >= created_at_kst + timedelta(minutes=1):
                 return await interaction.followup.send(
@@ -2038,6 +2056,7 @@ class BonusPointButton(discord.ui.Button):
                 _,
                 _,
                 session_password,
+                _,
                 _,
                 _
             ) = bonus_session
@@ -2647,7 +2666,7 @@ async def siege_command(ctx):
 
     try:
         session = await run_db(create_siege_session, date_text, password)
-        session_id, _, session_password, _ = session
+        session_id, _, session_password, _, _ = session
 
         admin_message = await ctx.send(
             "🏰 **공성전 출석 시작**\n\n"
