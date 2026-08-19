@@ -929,6 +929,47 @@ def load_bonus_session(session_id):
         release_db_connection(conn)
 
 
+def load_active_bonus_session(date_text, slot_text):
+    """현재 출석 시간대에서 아직 5분이 지나지 않은 마지막 가산점 세션."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, date, time_slot, points, password,
+                       created_at, message_id, created_at_kst
+                FROM bonus_sessions
+                WHERE date=%s
+                  AND time_slot=%s
+                  AND created_at_kst IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+            """, (str(date_text), str(slot_text)))
+            row = cursor.fetchone()
+
+            if not row:
+                return None
+
+            created = row[7]
+            try:
+                created_at_kst = datetime.strptime(
+                    str(created), "%Y-%m-%d %H:%M:%S.%f"
+                ).replace(tzinfo=KST)
+            except Exception:
+                try:
+                    created_at_kst = datetime.strptime(
+                        str(created), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=KST)
+                except Exception:
+                    return None
+
+            if datetime.now(KST) >= created_at_kst + timedelta(minutes=5):
+                return None
+
+            return row
+    finally:
+        release_db_connection(conn)
+
+
 def save_bonus_session(date_text, slot_text, points, password):
     """!가산점 호출마다 새로운 5분짜리 세션 생성."""
     conn = get_db_connection()
@@ -1290,7 +1331,7 @@ def save_bonus_attendance(
 
 
 def has_bonus_attendance_for_session(session_id, user_id):
-    """현재 1분 가산점 호출에서 이 사용자가 이미 점수를 받았는지 확인합니다."""
+    """현재 5분 가산점 호출에서 이 사용자가 이미 점수를 받았는지 확인합니다."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -1580,7 +1621,7 @@ async def send_boss_panel():
 
 class DropDeleteConfirmView(discord.ui.View):
     def __init__(self, drop_id, drop_text):
-        super().__init__(timeout=300)
+        super().__init__(timeout=60)
         self.drop_id = drop_id
         self.drop_text = drop_text
 
@@ -1808,7 +1849,7 @@ class DropResetConfirmModal(discord.ui.Modal, title="⚠️ 득템 전체 초기
 
 class DropResetView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=60)
 
     @discord.ui.button(
         label="⚠️ 득템 전체 초기화",
@@ -2062,7 +2103,7 @@ class BonusPasswordModal(
             elif result=="slot":
                 message="❌ 현재 출석 시간대의 가산점이 아닙니다."
             else:
-                message="❌ 이 가산점 호출은 1분이 지나 종료되었습니다."
+                message="❌ 이 가산점 호출은 5분이 지나 종료되었습니다."
 
             await interaction.followup.send(message,ephemeral=True)
 
@@ -2096,14 +2137,14 @@ class BonusButton(discord.ui.Button):
 
 
 class StandaloneBonusView(discord.ui.View):
-    """특정 !가산점 호출에 연결된 1분짜리 버튼."""
+    """특정 !가산점 호출에 연결된 5분짜리 버튼."""
     def __init__(self, session_id):
         super().__init__(timeout=300)
         self.add_item(BonusButton(session_id))
 
 
-async def delete_message_after(message, delay_seconds=300):
-    """1분 후 가산점 메시지를 삭제합니다."""
+async def delete_message_after(message, delay_seconds=60):
+    """호출자가 지정한 시간 후 메시지를 삭제합니다."""
     try:
         await asyncio.sleep(delay_seconds)
         try:
@@ -2121,7 +2162,7 @@ async def delete_message_after(message, delay_seconds=300):
 
 
 async def expire_bonus_session_after(session_id, delay_seconds=300):
-    """5분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
+    """1분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
     try:
         await asyncio.sleep(delay_seconds)
         await run_db(delete_bonus_session, session_id)
@@ -2137,7 +2178,7 @@ class BonusPointButton(discord.ui.Button):
             label=f"{points}점",
             style=discord.ButtonStyle.primary
         )
-        self.points=points
+        self.points = points
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin_channel(interaction):
@@ -2146,10 +2187,11 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
+        # DB 작업 전에 즉시 defer
         await interaction.response.defer(ephemeral=True)
 
-        now=datetime.now(KST)
-        active_session=get_active_attendance_session(now)
+        active_session = get_active_attendance_session(datetime.now(KST))
+
         if active_session is None:
             return await interaction.followup.send(
                 "⚠️ 현재는 출석 시간대가 아닙니다.\n"
@@ -2157,44 +2199,124 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
-        date_text,slot_text,_=active_session
-        password=generate_password()
+        date_text, slot_text, _ = active_session
 
         try:
-            bonus_session=await run_db(
-                save_bonus_session,date_text,slot_text,self.points,password
+            # -------------------------------------------------
+            # 현재 5분 이내에 살아있는 가산점이 있으면 재사용
+            # -------------------------------------------------
+            existing = await run_db(
+                load_active_bonus_session,
+                date_text,
+                slot_text
             )
-            (session_id,_,_,_,session_password,_,_,_)=bonus_session
 
-            attendance_channel=bot.get_channel(ATTENDANCE_CHANNEL_ID)
+            if existing:
+                (
+                    session_id,
+                    _,
+                    _,
+                    existing_points,
+                    existing_password,
+                    _,
+                    existing_message_id,
+                    _
+                ) = existing
+
+                return await interaction.followup.send(
+                    "🔵 **현재 가산점이 이미 활성화되어 있습니다.**\n\n"
+                    f"⭐ 가산점: **+{int(existing_points)}점**\n"
+                    f"🔐 가산점 비밀번호\n"
+                    f"```{existing_password}```\n\n"
+                    "⏰ **기존 가산점 호출은 최초 생성 시점부터 5분 동안 유효합니다.**",
+                    ephemeral=True
+                )
+
+            # -------------------------------------------------
+            # 5분이 지난 경우에만 새로운 가산점 세션 생성
+            # -------------------------------------------------
+            password = generate_password()
+
+            bonus_session = await run_db(
+                save_bonus_session,
+                date_text,
+                slot_text,
+                self.points,
+                password
+            )
+
+            (
+                session_id,
+                _,
+                _,
+                session_points,
+                session_password,
+                _,
+                _,
+                _
+            ) = bonus_session
+
+            # -------------------------------------------------
+            # 일반 혈맹방 가산점 패널
+            # -------------------------------------------------
+            attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+
             if attendance_channel is not None:
-                bonus_message=await attendance_channel.send(
+                bonus_message = await attendance_channel.send(
                     "🔵 **가산점 패널**\n"
-                    f"⭐ 가산점: **+{self.points}점**\n"
+                    f"⭐ 가산점: **+{int(session_points)}점**\n"
                     "아래 파란색 버튼을 눌러 비밀번호를 입력하세요.\n"
                     "⏰ **이 호출은 5분 동안만 유효합니다.**",
                     view=StandaloneBonusView(session_id)
                 )
-                bonus_message_ids.add(bonus_message.id)
-                await run_db(update_bonus_message_id,session_id,bonus_message.id)
-                asyncio.create_task(delete_message_after(bonus_message,60))
 
-            await interaction.followup.send(
-                f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
+                bonus_message_ids.add(bonus_message.id)
+
+                await run_db(
+                    update_bonus_message_id,
+                    session_id,
+                    bonus_message.id
+                )
+
+                # 5분 후 일반방 가산점 패널 삭제
+                asyncio.create_task(
+                    delete_message_after(bonus_message, 300)
+                )
+
+            # -------------------------------------------------
+            # 관리자방 비밀번호 메시지
+            #
+            # ephemeral이 아니라 실제 메시지로 보내서
+            # 5분 후 패널과 함께 자동 삭제할 수 있게 합니다.
+            # -------------------------------------------------
+            admin_password_message = await interaction.followup.send(
+                f"🔵 **가산점 +{int(session_points)}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
                 f"```{session_password}```\n\n"
                 "⏰ **이 호출은 5분 동안만 유효합니다.**",
-                ephemeral=True
+                wait=True
             )
-            asyncio.create_task(expire_bonus_session_after(session_id,60))
+
+            # 5분 후 관리자 비밀번호 메시지 삭제
+            asyncio.create_task(
+                delete_message_after(admin_password_message, 300)
+            )
+
+            # 5분 후 세션 종료
+            asyncio.create_task(
+                expire_bonus_session_after(session_id, 300)
+            )
 
         except Exception as e:
             print(f"[가산점 생성 오류] {type(e).__name__}: {e}")
-            await interaction.followup.send(
-                "❌ 가산점 생성 중 오류가 발생했습니다.\n"
-                f"오류: `{type(e).__name__}`",
-                ephemeral=True
-            )
+            try:
+                await interaction.followup.send(
+                    "❌ 가산점 생성 중 오류가 발생했습니다.\n"
+                    f"오류: `{type(e).__name__}`",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
 
 
 class BonusPanelView(discord.ui.View):
@@ -3208,7 +3330,7 @@ async def db_reset(ctx):
 
 class DBResetConfirmView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=60)
 
     @discord.ui.button(
         label="⚠️ 초기화 진행",
@@ -3422,7 +3544,7 @@ async def on_ready():
         f"운영 시간: 03:00, 09:00, 15:00, 21:00 (KST)"
     )
     print("출석 가능시간: 각 시작 시각부터 6시간")
-    print("가산점: 호출마다 새 세션 / 호출당 1분 유효")
+    print("가산점: 호출마다 새 세션 / 호출당 5분 유효")
     print("수동 출석: !출석")
     print("공성전 출석: !공성전 / 호출 후 1시간 유효")
 
