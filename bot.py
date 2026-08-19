@@ -415,9 +415,18 @@ def init_database():
                     time_slot TEXT NOT NULL,
                     points INTEGER NOT NULL,
                     password TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(date, time_slot)
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+
+            cursor.execute("""
+                ALTER TABLE bonus_sessions
+                DROP CONSTRAINT IF EXISTS bonus_sessions_date_time_slot_key
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS bonus_sessions_slot_idx
+                ON bonus_sessions(date, time_slot, created_at)
             """)
 
             cursor.execute("""
@@ -448,8 +457,24 @@ def init_database():
                     user_id BIGINT NOT NULL,
                     username TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(date, time_slot, user_id)
+                    bonus_session_id BIGINT
                 )
+            """)
+
+            cursor.execute("""
+                ALTER TABLE bonus_attendance
+                ADD COLUMN IF NOT EXISTS bonus_session_id BIGINT
+            """)
+
+            cursor.execute("""
+                ALTER TABLE bonus_attendance
+                DROP CONSTRAINT IF EXISTS bonus_attendance_date_time_slot_user_id_key
+            """)
+
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS bonus_attendance_session_user_idx
+                ON bonus_attendance(bonus_session_id, user_id)
+                WHERE bonus_session_id IS NOT NULL
             """)
 
             # 패널이 정각에 생성되지 못한 경우에도 재시작 후
@@ -693,27 +718,24 @@ def save_attendance(date, slot, user_id, username):
 # =====================================================
 # 🔹 가산점 DB 함수
 # =====================================================
-def load_bonus_session(date_text, slot_text):
+def load_bonus_session(session_id):
+    """특정 !가산점 호출 세션 조회."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT id, date, time_slot, points, password, created_at, message_id
                 FROM bonus_sessions
-                WHERE date=%s AND time_slot=%s
+                WHERE id=%s
                 LIMIT 1
-            """, (date_text, slot_text))
+            """, (int(session_id),))
             return cursor.fetchone()
     finally:
         release_db_connection(conn)
 
 
 def save_bonus_session(date_text, slot_text, points, password):
-    """
-    같은 시간대 가산점은 최초 생성 1건만 인정합니다.
-    동시에 두 관리자가 눌러도 UPDATE로 덮어쓰지 않습니다.
-    반환값: (새로 생성했는지, 세션 row)
-    """
+    """!가산점 호출마다 새로운 1분짜리 세션을 생성."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -721,25 +743,11 @@ def save_bonus_session(date_text, slot_text, points, password):
                 INSERT INTO bonus_sessions
                     (date, time_slot, points, password)
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT (date, time_slot) DO NOTHING
                 RETURNING id, date, time_slot, points, password, created_at, message_id
             """, (date_text, slot_text, points, password))
-
             row = cursor.fetchone()
-            inserted = row is not None
-
-            if row is None:
-                cursor.execute("""
-                    SELECT id, date, time_slot, points, password, created_at, message_id
-                    FROM bonus_sessions
-                    WHERE date=%s AND time_slot=%s
-                    LIMIT 1
-                """, (date_text, slot_text))
-                row = cursor.fetchone()
-
-            conn.commit()
-            return inserted, row
-
+        conn.commit()
+        return row
     except Exception:
         conn.rollback()
         raise
@@ -747,15 +755,32 @@ def save_bonus_session(date_text, slot_text, points, password):
         release_db_connection(conn)
 
 
-def update_bonus_message_id(date_text, slot_text, message_id):
+def update_bonus_message_id(session_id, message_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 UPDATE bonus_sessions
                 SET message_id=%s
-                WHERE date=%s AND time_slot=%s
-            """, (int(message_id), date_text, slot_text))
+                WHERE id=%s
+            """, (int(message_id), int(session_id)))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def delete_bonus_session(session_id):
+    """1분짜리 세션만 삭제. bonus_attendance 기록은 유지."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM bonus_sessions WHERE id=%s",
+                (int(session_id),)
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -780,20 +805,37 @@ def has_bonus_attendance(date_text, slot_text, user_id):
         release_db_connection(conn)
 
 
-def save_bonus_attendance(date_text, slot_text, points, user_id, username, time_text=None):
-    """가산점도 SELECT 후 INSERT가 아니라 원자적 INSERT 1회로 처리합니다."""
+def save_bonus_attendance(
+    session_id,
+    date_text,
+    slot_text,
+    points,
+    user_id,
+    username,
+    time_text=None
+):
+    """
+    같은 호출에서는 사용자당 1회.
+    새로운 !가산점 호출에서는 다시 받을 수 있습니다.
+    """
     conn = get_db_connection()
-
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO bonus_attendance
-                    (date, time_slot, points, user_id, username)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (date, time_slot, user_id)
+                    (date, time_slot, points, user_id, username, bonus_session_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (bonus_session_id, user_id)
                 DO NOTHING
                 RETURNING id
-            """, (date_text, slot_text, points, user_id, username))
+            """, (
+                date_text,
+                slot_text,
+                points,
+                user_id,
+                username,
+                int(session_id)
+            ))
 
             row = cursor.fetchone()
             inserted = row is not None
@@ -809,14 +851,14 @@ def save_bonus_attendance(date_text, slot_text, points, user_id, username, time_
                     points
                 )
 
-            conn.commit()
-            return inserted
-
+        conn.commit()
+        return inserted
     except Exception:
         conn.rollback()
         raise
     finally:
         release_db_connection(conn)
+
 
 def get_next_google_sheet_job():
     conn = get_db_connection()
@@ -1409,10 +1451,9 @@ class BonusPasswordModal(
         required=True
     )
 
-    def __init__(self, date_text, slot_text):
+    def __init__(self, session_id):
         super().__init__()
-        self.date_text = date_text
-        self.slot_text = slot_text
+        self.session_id = int(session_id)
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.channel_id != ATTENDANCE_CHANNEL_ID:
@@ -1424,35 +1465,34 @@ class BonusPasswordModal(
         await interaction.response.defer(ephemeral=True)
 
         try:
-            # 비밀번호/점수/생성시각을 메모리가 아니라 DB에서 다시 읽습니다.
-            # Render 재시작 후에도 기존 가산점 패널이 계속 작동할 수 있습니다.
-            bonus_session = await run_db(
-                load_bonus_session,
-                self.date_text,
-                self.slot_text
-            )
+            bonus_session = await run_db(load_bonus_session, self.session_id)
 
             if not bonus_session:
                 return await interaction.followup.send(
-                    "❌ 현재 활성화된 가산점이 없습니다.",
+                    "❌ 이 가산점 호출은 이미 종료되었습니다.",
                     ephemeral=True
                 )
 
-            _, date_text, slot_text, bonus_points, stored_password, created_at, _ = bonus_session
+            (
+                session_id,
+                date_text,
+                slot_text,
+                bonus_points,
+                stored_password,
+                created_at,
+                _
+            ) = bonus_session
+
             now = datetime.now(KST)
+            active_session = get_active_attendance_session(now)
 
-            # 현재 KST 시간대의 실제 출석 세션을 다시 계산합니다.
-            # 00:00~02:59에는 전날 21시 세션이므로 DB의 date와 오늘 날짜를
-            # 단순 비교하면 안 됩니다.
-            current_active_session = get_active_attendance_session(now)
-
-            if current_active_session is None:
+            if active_session is None:
                 return await interaction.followup.send(
                     "❌ 현재 출석 시간대가 종료되었습니다.",
                     ephemeral=True
                 )
 
-            active_date, active_slot, active_session_start = current_active_session
+            active_date, active_slot, _ = active_session
 
             if str(date_text) != str(active_date) or str(slot_text) != str(active_slot):
                 return await interaction.followup.send(
@@ -1460,63 +1500,50 @@ class BonusPasswordModal(
                     ephemeral=True
                 )
 
-            # 가산점 세션 자체는 해당 출석 시간대가 끝날 때까지 유효합니다.
-            if now >= active_session_start + timedelta(hours=6):
+            created_at_kst = created_at
+            if created_at_kst.tzinfo is None:
+                created_at_kst = created_at_kst.replace(tzinfo=KST)
+            else:
+                created_at_kst = created_at_kst.astimezone(KST)
+
+            if now >= created_at_kst + timedelta(minutes=1):
                 return await interaction.followup.send(
-                    "❌ 현재 출석 시간대가 종료되었습니다.",
+                    "❌ 이 가산점 호출은 1분이 지나 종료되었습니다.",
                     ephemeral=True
                 )
 
-            # created_at은 메시지/버튼 표시 시간을 관리하는 용도의 기록값이며,
-            # 실제 가산점 사용 가능 시간은 위의 출석 세션 종료 시각으로 판정합니다.
-
-                if now >= created_at_kst + timedelta(hours=6):
-                    return await interaction.followup.send(
-                        "❌ 현재 출석 시간대의 가산점 유효시간이 종료되었습니다.",
-                        ephemeral=True
-                    )
-
-            entered = str(self.password_input.value).strip()
-
-            if entered != str(stored_password):
+            if str(self.password_input.value).strip() != str(stored_password):
                 return await interaction.followup.send(
                     "❌ 가산점 비밀번호가 틀렸습니다.",
                     ephemeral=True
                 )
 
-            user_id = interaction.user.id
-            username = interaction.user.display_name
-            now_text = now.strftime("%H:%M:%S")
-
             inserted = await run_db(
                 save_bonus_attendance,
+                session_id,
                 date_text,
                 slot_text,
                 int(bonus_points),
-                user_id,
-                username,
-                now_text
+                interaction.user.id,
+                interaction.user.display_name,
+                now.strftime("%H:%M:%S")
             )
 
             if not inserted:
                 return await interaction.followup.send(
-                    "⚠️ 이미 이번 가산점을 받으셨습니다.",
+                    "⚠️ 이번 가산점 호출에서는 이미 점수를 받으셨습니다.",
                     ephemeral=True
                 )
 
             await interaction.followup.send(
                 f"🔵 **가산점 +{int(bonus_points)}점 지급 완료!**\n"
-                f"👤 {username}\n"
+                f"👤 {interaction.user.display_name}\n"
                 f"⭐ +{int(bonus_points)}점",
                 ephemeral=True
             )
 
         except Exception as e:
-            print(
-                f"[가산점 처리 오류] "
-                f"{type(e).__name__}: {e}"
-            )
-
+            print(f"[가산점 처리 오류] {type(e).__name__}: {e}")
             try:
                 await interaction.followup.send(
                     "❌ 가산점 처리 중 오류가 발생했습니다.",
@@ -1527,46 +1554,76 @@ class BonusPasswordModal(
 
 
 class BonusButton(discord.ui.Button):
-    def __init__(self):
+    def __init__(self, session_id):
         super().__init__(
             label="🔵 가산점",
             style=discord.ButtonStyle.primary,
-            custom_id="raid_bonus_button"
+            custom_id=f"raid_bonus_button_{int(session_id)}"
         )
+        self.session_id = int(session_id)
 
     async def callback(self, interaction: discord.Interaction):
-        active_session = get_active_attendance_session()
-
-        if active_session is None:
-            return await interaction.response.send_message(
-                "❌ 현재는 출석 시간대가 아닙니다.",
-                ephemeral=True
-            )
-
-        date_text, slot_text, _ = active_session
-        bonus_session = await run_db(load_bonus_session, date_text, slot_text)
+        bonus_session = await run_db(load_bonus_session, self.session_id)
 
         if not bonus_session:
             return await interaction.response.send_message(
-                "❌ 현재 활성화된 가산점이 없습니다.",
+                "❌ 이 가산점 호출은 이미 종료되었습니다.",
+                ephemeral=True
+            )
+
+        (
+            session_id,
+            date_text,
+            slot_text,
+            _,
+            _,
+            created_at,
+            _
+        ) = bonus_session
+
+        now = datetime.now(KST)
+        active_session = get_active_attendance_session(now)
+
+        if active_session is None:
+            return await interaction.response.send_message(
+                "❌ 현재 출석 시간대가 아닙니다.",
+                ephemeral=True
+            )
+
+        active_date, active_slot, _ = active_session
+
+        if str(date_text) != str(active_date) or str(slot_text) != str(active_slot):
+            return await interaction.response.send_message(
+                "❌ 현재 출석 시간대의 가산점이 아닙니다.",
+                ephemeral=True
+            )
+
+        created_at_kst = created_at
+        if created_at_kst.tzinfo is None:
+            created_at_kst = created_at_kst.replace(tzinfo=KST)
+        else:
+            created_at_kst = created_at_kst.astimezone(KST)
+
+        if now >= created_at_kst + timedelta(minutes=1):
+            return await interaction.response.send_message(
+                "❌ 이 가산점 호출은 1분이 지나 종료되었습니다.",
                 ephemeral=True
             )
 
         await interaction.response.send_modal(
-            BonusPasswordModal(date_text, slot_text)
+            BonusPasswordModal(session_id)
         )
 
 
 class StandaloneBonusView(discord.ui.View):
-    """일반 출석창에 별도로 표시되는 가산점 전용 Persistent View."""
+    """특정 !가산점 호출에 연결된 1분짜리 버튼."""
+    def __init__(self, session_id):
+        super().__init__(timeout=60)
+        self.add_item(BonusButton(session_id))
 
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(BonusButton())
 
-
-async def delete_message_after(message, delay_seconds=3600):
-    """지정 시간 후 Discord 메시지를 삭제합니다."""
+async def delete_message_after(message, delay_seconds=60):
+    """1분 후 가산점 메시지를 삭제합니다."""
     try:
         await asyncio.sleep(delay_seconds)
         try:
@@ -1582,6 +1639,18 @@ async def delete_message_after(message, delay_seconds=3600):
     except asyncio.CancelledError:
         raise
 
+
+async def expire_bonus_session_after(session_id, delay_seconds=60):
+    """1분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        await run_db(delete_bonus_session, session_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[가산점 세션 자동삭제 오류] {type(e).__name__}: {e}")
+
+
 class BonusPointButton(discord.ui.Button):
     def __init__(self, points):
         super().__init__(
@@ -1591,12 +1660,6 @@ class BonusPointButton(discord.ui.Button):
         self.points = points
 
     async def callback(self, interaction: discord.Interaction):
-        global bonus_password
-        global bonus_date
-        global bonus_slot
-        global bonus_points
-        global bonus_created_at
-
         if not is_admin_channel(interaction):
             return await interaction.response.send_message(
                 "❌ 관리자 전용방에서만 사용할 수 있습니다.",
@@ -1613,12 +1676,12 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
-        date_text, slot_text, session_start = active_session
-
+        date_text, slot_text, _ = active_session
         password = generate_password()
 
         try:
-            inserted, bonus_session = await run_db(
+            # 호출할 때마다 새로운 세션 생성
+            bonus_session = await run_db(
                 save_bonus_session,
                 date_text,
                 slot_text,
@@ -1626,108 +1689,57 @@ class BonusPointButton(discord.ui.Button):
                 password
             )
 
-            if not inserted:
-                # 같은 시간대의 가산점이 이미 있으면 새 세션을 만들지 않고
-                # 기존 비밀번호/점수로 관리자방과 일반 혈맹창에 다시 표시합니다.
-                # 단, 현재 출석 시간대가 끝나기 전(예: 21시 세션이면 03:00 전)이어야 합니다.
-                existing_points = int(bonus_session[3]) if bonus_session else 0
-                existing_password = str(bonus_session[4]) if bonus_session else ""
+            (
+                session_id,
+                _,
+                _,
+                _,
+                session_password,
+                _,
+                _
+            ) = bonus_session
 
-                bonus_password = existing_password
-                bonus_date = date_text
-                bonus_slot = slot_text
-                bonus_points = existing_points
-                bonus_created_at = (
-                    bonus_session[5]
-                    if bonus_session and bonus_session[5] is not None
-                    else now
-                )
-
-                await interaction.response.send_message(
-                    f"🔵 **가산점 +{existing_points}점**\n\n"
-                    f"🔐 가산점 비밀번호\n"
-                    f"```{existing_password}```\n\n"
-                    "⏰ 메시지/버튼 유지시간: 1시간"
-                )
-                admin_bonus_message = await interaction.original_response()
-                asyncio.create_task(
-                    delete_message_after(admin_bonus_message, 3600)
-                )
-
-                attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
-                if attendance_channel is not None:
-                    bonus_message = await attendance_channel.send(
-                        "🔵 **가산점 패널**\n"
-                        f"⭐ 현재 가산점: **+{existing_points}점**\n"
-                        "아래 파란색 버튼을 눌러 가산점 비밀번호를 입력하세요.\n"
-                        "⏰ 메시지/버튼 유지시간: 1시간",
-                        view=StandaloneBonusView()
-                    )
-                    bonus_message_ids.add(bonus_message.id)
-                    await run_db(
-                        update_bonus_message_id,
-                        date_text,
-                        slot_text,
-                        bonus_message.id
-                    )
-                    asyncio.create_task(
-                        delete_message_after(bonus_message, 3600)
-                    )
-
-                return
-
-            # 메모리 변수는 화면 표시용 캐시일 뿐, 실제 인증 기준은 DB입니다.
-            bonus_password = password
-            bonus_date = date_text
-            bonus_slot = slot_text
-            bonus_points = self.points
-            bonus_created_at = now
-
-            # 관리자방에는 비밀번호를 표시하고 1시간 후 삭제합니다.
-            # 일반 혈맹창 가산점 버튼도 1시간 후 삭제합니다.
             await interaction.response.send_message(
                 f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
-                f"```{password}```\n\n"
-                "⏰ 메시지/버튼 유지시간: 1시간"
+                f"```{session_password}```\n\n"
+                "⏰ **이 호출은 1분 동안만 유효합니다.**"
             )
+
             admin_bonus_message = await interaction.original_response()
-            asyncio.create_task(
-                delete_message_after(admin_bonus_message, 3600)
-            )
+            asyncio.create_task(delete_message_after(admin_bonus_message, 60))
+            asyncio.create_task(expire_bonus_session_after(session_id, 60))
 
             attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
 
             if attendance_channel is not None:
                 bonus_message = await attendance_channel.send(
                     "🔵 **가산점 패널**\n"
-                    f"⭐ 현재 가산점: **+{self.points}점**\n"
-                    "아래 파란색 버튼을 눌러 가산점 비밀번호를 입력하세요.\n"
-                    "⏰ 메시지/버튼 유지시간: 1시간",
-                    view=StandaloneBonusView()
+                    f"⭐ 가산점: **+{self.points}점**\n"
+                    "아래 파란색 버튼을 눌러 비밀번호를 입력하세요.\n"
+                    "⏰ **이 호출은 1분 동안만 유효합니다.**",
+                    view=StandaloneBonusView(session_id)
                 )
+
                 bonus_message_ids.add(bonus_message.id)
+
                 await run_db(
                     update_bonus_message_id,
-                    date_text,
-                    slot_text,
+                    session_id,
                     bonus_message.id
                 )
-                asyncio.create_task(
-                    delete_message_after(bonus_message, 3600)
-                )
 
+                asyncio.create_task(delete_message_after(bonus_message, 60))
 
         except Exception as e:
-            print(
-                f"[가산점 생성 오류] "
-                f"{type(e).__name__}: {e}"
-            )
-
-            await interaction.response.send_message(
-                "❌ 가산점 생성 중 오류가 발생했습니다.",
-                ephemeral=True
-            )
+            print(f"[가산점 생성 오류] {type(e).__name__}: {e}")
+            try:
+                await interaction.followup.send(
+                    "❌ 가산점 생성 중 오류가 발생했습니다.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
 
 
 class BonusPanelView(discord.ui.View):
@@ -2086,32 +2098,7 @@ async def automatic_channel_cleanup():
     now = datetime.now(KST)
 
     if TEST_MODE:
-        # 테스트 모드에서도 가산점 종료 여부는 DB의 created_at을 기준으로 합니다.
-        date_text = now.strftime("%Y-%m-%d")
-        slot_text = get_test_session_slot(now)
-        bonus_session = await run_db(load_bonus_session, date_text, slot_text)
-
-        if bonus_session and bonus_session[5] is not None:
-            created_at = bonus_session[5]
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=KST)
-            else:
-                created_at = created_at.astimezone(KST)
-
-            if now >= created_at + timedelta(hours=6):
-                message_id = bonus_session[6]
-                attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
-
-                if message_id and attendance_channel is not None:
-                    try:
-                        message = await attendance_channel.fetch_message(message_id)
-                        await message.delete()
-                    except Exception:
-                        pass
-
-                await run_db(delete_bonus_session, date_text, slot_text)
-                print("[가산점 종료] 6시간이 지나 가산점 세션을 종료했습니다.")
-
+        # 가산점은 호출별 1분 세션이므로 별도 6시간 종료 처리를 하지 않습니다.
         return
 
     # 운영 모드:
@@ -3225,7 +3212,7 @@ async def on_ready():
         f"운영 시간: 03:00, 09:00, 15:00, 21:00 (KST)"
     )
     print("출석 가능시간: 각 시작 시각부터 6시간")
-    print("가산점: 동일 출석 시간대 1회 / 메시지·버튼 1시간")
+    print("가산점: 호출마다 새 세션 / 호출당 1분 유효")
     print("수동 출석: !출석")
 
 
