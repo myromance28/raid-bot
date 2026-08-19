@@ -423,6 +423,12 @@ def init_database():
                 ALTER TABLE bonus_sessions
                 DROP CONSTRAINT IF EXISTS bonus_sessions_date_time_slot_key
             """)
+            cursor.execute("""
+                DROP INDEX IF EXISTS bonus_sessions_date_time_slot_key
+            """)
+            cursor.execute("""
+                DROP INDEX IF EXISTS bonus_sessions_date_time_slot_unique_idx
+            """)
 
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS bonus_sessions_slot_idx
@@ -469,6 +475,9 @@ def init_database():
             cursor.execute("""
                 ALTER TABLE bonus_attendance
                 DROP CONSTRAINT IF EXISTS bonus_attendance_date_time_slot_user_id_key
+            """)
+            cursor.execute("""
+                DROP INDEX IF EXISTS bonus_attendance_date_time_slot_user_id_key
             """)
 
             cursor.execute("""
@@ -856,6 +865,22 @@ def save_bonus_attendance(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        release_db_connection(conn)
+
+
+def has_bonus_attendance_for_session(session_id, user_id):
+    """현재 1분 가산점 호출에서 이 사용자가 이미 점수를 받았는지 확인합니다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 1
+                FROM bonus_attendance
+                WHERE bonus_session_id=%s AND user_id=%s
+                LIMIT 1
+            """, (int(session_id), int(user_id)))
+            return cursor.fetchone() is not None
     finally:
         release_db_connection(conn)
 
@@ -1563,55 +1588,10 @@ class BonusButton(discord.ui.Button):
         self.session_id = int(session_id)
 
     async def callback(self, interaction: discord.Interaction):
-        bonus_session = await run_db(load_bonus_session, self.session_id)
-
-        if not bonus_session:
-            return await interaction.response.send_message(
-                "❌ 이 가산점 호출은 이미 종료되었습니다.",
-                ephemeral=True
-            )
-
-        (
-            session_id,
-            date_text,
-            slot_text,
-            _,
-            _,
-            created_at,
-            _
-        ) = bonus_session
-
-        now = datetime.now(KST)
-        active_session = get_active_attendance_session(now)
-
-        if active_session is None:
-            return await interaction.response.send_message(
-                "❌ 현재 출석 시간대가 아닙니다.",
-                ephemeral=True
-            )
-
-        active_date, active_slot, _ = active_session
-
-        if str(date_text) != str(active_date) or str(slot_text) != str(active_slot):
-            return await interaction.response.send_message(
-                "❌ 현재 출석 시간대의 가산점이 아닙니다.",
-                ephemeral=True
-            )
-
-        created_at_kst = created_at
-        if created_at_kst.tzinfo is None:
-            created_at_kst = created_at_kst.replace(tzinfo=KST)
-        else:
-            created_at_kst = created_at_kst.astimezone(KST)
-
-        if now >= created_at_kst + timedelta(minutes=1):
-            return await interaction.response.send_message(
-                "❌ 이 가산점 호출은 1분이 지나 종료되었습니다.",
-                ephemeral=True
-            )
-
+        # 버튼 클릭 순간에는 DB 조회를 하지 않고 즉시 비밀번호 입력창을 띄웁니다.
+        # 실제 중복 지급 여부는 비밀번호 제출 시점의 원자적 INSERT에서 최종 판정합니다.
         await interaction.response.send_modal(
-            BonusPasswordModal(session_id)
+            BonusPasswordModal(self.session_id)
         )
 
 
@@ -1746,7 +1726,7 @@ class BonusPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
 
-        for points in range(1, 6):
+        for points in range(1, 4):
             self.add_item(BonusPointButton(points))
 
 
