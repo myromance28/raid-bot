@@ -392,9 +392,10 @@ def init_database():
                 )
             """)
 
+            # 기존 데이터에 중복 행이 있어도 부팅이 실패하지 않도록
+            # 과거의 UNIQUE 인덱스를 사용하지 않습니다.
             cursor.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS attendance_v2_unique_idx
-                ON attendance_v2(date, time_slot, user_id)
+                DROP INDEX IF EXISTS attendance_v2_unique_idx
             """)
 
             # 현재 출석 세션/비밀번호 저장
@@ -432,6 +433,11 @@ def init_database():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(siege_session_id, user_id)
                 )
+            """)
+
+            cursor.execute("""
+                ALTER TABLE siege_attendance
+                DROP CONSTRAINT IF EXISTS siege_attendance_siege_session_id_user_id_key
             """)
 
             # 가산점 세션
@@ -594,10 +600,10 @@ def init_database():
                 END $$;
             """)
 
+            # 기존 데이터에 중복이 있어도 부팅이 실패하지 않도록
+            # UNIQUE 인덱스 대신 트랜잭션 advisory lock으로 중복을 방지합니다.
             cursor.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS bonus_attendance_session_user_idx
-                ON bonus_attendance(bonus_session_id, user_id)
-                WHERE bonus_session_id IS NOT NULL
+                DROP INDEX IF EXISTS bonus_attendance_session_user_idx
             """)
 
             # 패널이 정각에 생성되지 못한 경우에도 재시작 후
@@ -767,6 +773,18 @@ def has_attendance(date, slot, user_id):
         release_db_connection(conn)
 
 
+def acquire_attendance_lock(cursor, lock_key):
+    """
+    PostgreSQL transaction advisory lock.
+    동일한 사용자/세션 키의 동시 요청만 직렬화하고,
+    서로 다른 150명은 병렬 처리할 수 있도록 합니다.
+    """
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (str(lock_key),)
+    )
+
+
 def enqueue_google_sheet_record(
     cursor,
     date_text,
@@ -833,18 +851,28 @@ def save_attendance_atomic(
                 conn.rollback()
                 return "password"
 
+            acquire_attendance_lock(
+                cursor,
+                f"attendance:{date_text}:{slot_text}:{int(user_id)}"
+            )
+
+            cursor.execute("""
+                SELECT 1
+                FROM attendance_v2
+                WHERE date=%s AND time_slot=%s AND user_id=%s
+                LIMIT 1
+            """, (date_text, slot_text, int(user_id)))
+
+            if cursor.fetchone() is not None:
+                conn.rollback()
+                return "duplicate"
+
             cursor.execute("""
                 INSERT INTO attendance_v2
                     (date, time_slot, user_id, username, points)
                 VALUES (%s, %s, %s, %s, 1)
-                ON CONFLICT (date, time_slot, user_id)
-                DO NOTHING
                 RETURNING id
             """, (date_text, slot_text, int(user_id), str(username)))
-
-            if cursor.fetchone() is None:
-                conn.rollback()
-                return "duplicate"
 
             enqueue_google_sheet_record(
                 cursor,
@@ -867,41 +895,37 @@ def save_attendance_atomic(
 
 
 def save_attendance(date, slot, user_id, username):
-    """
-    출석 중복 확인 SELECT를 별도로 하지 않고 INSERT 한 번으로 처리합니다.
-    150명이 동시에 눌러도 PostgreSQL UNIQUE 제약이 최종 중복 방지를 담당합니다.
-    """
+    """기존 호환용 출석 저장 함수. 동시 중복은 advisory lock으로 방지합니다."""
     conn = get_db_connection()
-
     try:
         with conn.cursor() as cursor:
+            acquire_attendance_lock(
+                cursor,
+                f"attendance:{date}:{slot}:{int(user_id)}"
+            )
+
+            cursor.execute("""
+                SELECT 1
+                FROM attendance_v2
+                WHERE date=%s AND time_slot=%s AND user_id=%s
+                LIMIT 1
+            """, (date, slot, int(user_id)))
+
+            if cursor.fetchone() is not None:
+                conn.rollback()
+                return False
+
             cursor.execute("""
                 INSERT INTO attendance_v2
                     (date, time_slot, user_id, username, points)
                 VALUES (%s, %s, %s, %s, 1)
-                ON CONFLICT (date, time_slot, user_id)
-                DO NOTHING
                 RETURNING id
-            """, (date, slot, user_id, username))
+            """, (date, slot, int(user_id), str(username)))
 
-            row = cursor.fetchone()
-            inserted = row is not None
+            return_value = cursor.fetchone() is not None
 
-            if inserted:
-                # Discord 응답 시간과 무관하게 Sheets는 별도 워커가 처리합니다.
-                enqueue_google_sheet_record(
-                    cursor,
-                    date,
-                    datetime.now(KST).strftime("%H:%M:%S"),
-                    "출석",
-                    user_id,
-                    username,
-                    1
-                )
-
-            conn.commit()
-            return inserted
-
+        conn.commit()
+        return return_value
     except Exception:
         conn.rollback()
         raise
@@ -909,9 +933,6 @@ def save_attendance(date, slot, user_id, username):
         release_db_connection(conn)
 
 
-# =====================================================
-# 🔹 가산점 DB 함수
-# =====================================================
 def load_bonus_session(session_id):
     """특정 !가산점 호출 세션 조회."""
     conn = get_db_connection()
@@ -966,6 +987,95 @@ def load_active_bonus_session(date_text, slot_text):
                 return None
 
             return row
+    finally:
+        release_db_connection(conn)
+
+
+def get_or_create_bonus_session_locked(date_text, slot_text, points, password):
+    """
+    같은 출석 시간대의 가산점 세션 생성 경쟁을 PostgreSQL transaction
+    advisory lock으로 막습니다.
+
+    반환:
+      (session_row, True)  = 새 세션 생성
+      (session_row, False) = 기존 5분 세션 재사용
+    """
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            # 같은 시간대의 가산점 세션 생성만 직렬화합니다.
+            # 서로 다른 150명의 출석 제출은 서로 막지 않습니다.
+            acquire_attendance_lock(
+                cursor,
+                f"bonus-session-create:{date_text}:{slot_text}"
+            )
+
+            cursor.execute("""
+                SELECT id, date, time_slot, points, password,
+                       created_at, message_id, created_at_kst
+                FROM bonus_sessions
+                WHERE date=%s
+                  AND time_slot=%s
+                  AND created_at_kst IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+            """, (str(date_text), str(slot_text)))
+
+            existing = cursor.fetchone()
+
+            if existing:
+                created_text = existing[7]
+
+                try:
+                    created_at_kst = datetime.strptime(
+                        str(created_text),
+                        "%Y-%m-%d %H:%M:%S.%f"
+                    ).replace(tzinfo=KST)
+                except Exception:
+                    try:
+                        created_at_kst = datetime.strptime(
+                            str(created_text),
+                            "%Y-%m-%d %H:%M:%S"
+                        ).replace(tzinfo=KST)
+                    except Exception:
+                        created_at_kst = None
+
+                if (
+                    created_at_kst is not None
+                    and datetime.now(KST) <
+                    created_at_kst + timedelta(minutes=5)
+                ):
+                    conn.rollback()
+                    return existing, False
+
+            created_at_kst_text = datetime.now(KST).strftime(
+                "%Y-%m-%d %H:%M:%S.%f"
+            )
+
+            cursor.execute("""
+                INSERT INTO bonus_sessions
+                    (date, time_slot, points, password, created_at_kst)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, date, time_slot, points, password,
+                          created_at, message_id, created_at_kst
+            """, (
+                str(date_text),
+                str(slot_text),
+                int(points),
+                str(password),
+                created_at_kst_text
+            ))
+
+            row = cursor.fetchone()
+
+        conn.commit()
+        return row, True
+
+    except Exception:
+        conn.rollback()
+        raise
+
     finally:
         release_db_connection(conn)
 
@@ -1080,7 +1190,7 @@ def save_siege_attendance_atomic(
     user_id,
     username
 ):
-    """공성전 출석 1회 처리를 하나의 DB 트랜잭션으로 수행합니다."""
+    """공성전 출석을 하나의 DB 트랜잭션으로 처리합니다."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -1123,12 +1233,26 @@ def save_siege_attendance_atomic(
                 conn.rollback()
                 return "password"
 
+            acquire_attendance_lock(
+                cursor,
+                f"siege:{int(db_session_id)}:{int(user_id)}"
+            )
+
+            cursor.execute("""
+                SELECT 1
+                FROM siege_attendance
+                WHERE siege_session_id=%s AND user_id=%s
+                LIMIT 1
+            """, (int(db_session_id), int(user_id)))
+
+            if cursor.fetchone() is not None:
+                conn.rollback()
+                return "duplicate"
+
             cursor.execute("""
                 INSERT INTO siege_attendance
                     (siege_session_id, date, user_id, username)
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT (siege_session_id, user_id)
-                DO NOTHING
                 RETURNING id
             """, (
                 int(db_session_id),
@@ -1137,15 +1261,10 @@ def save_siege_attendance_atomic(
                 str(username)
             ))
 
-            if cursor.fetchone() is None:
-                conn.rollback()
-                return "duplicate"
-
-            # 공성출석은 날짜/닉네임/출석만 필요하므로 time은 빈 값으로 큐에 저장합니다.
             enqueue_google_sheet_record(
                 cursor,
                 date_text,
-                "",
+                f"session:{int(db_session_id)}",
                 "공성출석",
                 user_id,
                 username,
@@ -1202,8 +1321,8 @@ def save_bonus_attendance_atomic(
     username,
     time_text
 ):
-    """가산점 제출 전체를 하나의 DB 트랜잭션으로 처리."""
-    conn=get_db_connection()
+    """가산점 제출 전체를 하나의 DB 트랜잭션으로 처리합니다."""
+    conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -1211,58 +1330,89 @@ def save_bonus_attendance_atomic(
                 FROM bonus_sessions
                 WHERE id=%s
                 LIMIT 1
-            """,(int(session_id),))
-            session=cursor.fetchone()
+            """, (int(session_id),))
+            session = cursor.fetchone()
 
             if not session:
                 conn.rollback()
                 return "expired", None
 
-            db_session_id,date_text,slot_text,points,stored_password,created_at_kst_text=session
+            (
+                db_session_id,
+                date_text,
+                slot_text,
+                points,
+                stored_password,
+                created_at_kst_text
+            ) = session
 
-            if str(date_text)!=str(active_date) or str(slot_text)!=str(active_slot):
+            if str(date_text) != str(active_date) or str(slot_text) != str(active_slot):
                 conn.rollback()
                 return "slot", None
 
             try:
-                created_at_kst=datetime.strptime(
-                    str(created_at_kst_text), "%Y-%m-%d %H:%M:%S.%f"
+                created_at_kst = datetime.strptime(
+                    str(created_at_kst_text),
+                    "%Y-%m-%d %H:%M:%S.%f"
                 ).replace(tzinfo=KST)
             except Exception:
                 try:
-                    created_at_kst=datetime.strptime(
-                        str(created_at_kst_text), "%Y-%m-%d %H:%M:%S"
+                    created_at_kst = datetime.strptime(
+                        str(created_at_kst_text),
+                        "%Y-%m-%d %H:%M:%S"
                     ).replace(tzinfo=KST)
                 except Exception:
                     conn.rollback()
                     return "expired", None
 
-            now=datetime.now(KST)
+            now = datetime.now(KST)
+
             if now >= created_at_kst + timedelta(minutes=5):
                 conn.rollback()
                 return "expired", None
 
-            if str(entered_password).strip()!=str(stored_password):
+            if str(entered_password).strip() != str(stored_password):
                 conn.rollback()
                 return "password", None
+
+            acquire_attendance_lock(
+                cursor,
+                f"bonus:{int(db_session_id)}:{int(user_id)}"
+            )
+
+            cursor.execute("""
+                SELECT 1
+                FROM bonus_attendance
+                WHERE bonus_session_id=%s AND user_id=%s
+                LIMIT 1
+            """, (int(db_session_id), int(user_id)))
+
+            if cursor.fetchone() is not None:
+                conn.rollback()
+                return "duplicate", int(points)
 
             cursor.execute("""
                 INSERT INTO bonus_attendance
                     (date, time_slot, points, user_id, username, bonus_session_id)
                 VALUES (%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (bonus_session_id,user_id)
-                DO NOTHING
                 RETURNING id
-            """,(str(date_text),str(slot_text),int(points),int(user_id),
-                 str(username),int(db_session_id)))
-
-            if cursor.fetchone() is None:
-                conn.rollback()
-                return "duplicate", int(points)
+            """, (
+                str(date_text),
+                str(slot_text),
+                int(points),
+                int(user_id),
+                str(username),
+                int(db_session_id)
+            ))
 
             enqueue_google_sheet_record(
-                cursor,str(date_text),str(time_text),"가산점",
-                int(user_id),str(username),int(points)
+                cursor,
+                str(date_text),
+                str(time_text),
+                "가산점",
+                int(user_id),
+                str(username),
+                int(points)
             )
 
         conn.commit()
@@ -1284,41 +1434,51 @@ def save_bonus_attendance(
     username,
     time_text=None
 ):
-    """
-    같은 호출에서는 사용자당 1회.
-    새로운 !가산점 호출에서는 다시 받을 수 있습니다.
-    """
+    """기존 호환용 가산점 저장 함수. 같은 세션에서는 사용자당 1회."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            acquire_attendance_lock(
+                cursor,
+                f"bonus:{int(session_id)}:{int(user_id)}"
+            )
+
+            cursor.execute("""
+                SELECT 1
+                FROM bonus_attendance
+                WHERE bonus_session_id=%s AND user_id=%s
+                LIMIT 1
+            """, (int(session_id), int(user_id)))
+
+            if cursor.fetchone() is not None:
+                conn.rollback()
+                return False
+
             cursor.execute("""
                 INSERT INTO bonus_attendance
                     (date, time_slot, points, user_id, username, bonus_session_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (bonus_session_id, user_id)
-                DO NOTHING
+                VALUES (%s,%s,%s,%s,%s,%s)
                 RETURNING id
             """, (
-                date_text,
-                slot_text,
-                points,
-                user_id,
-                username,
+                str(date_text),
+                str(slot_text),
+                int(points),
+                int(user_id),
+                str(username),
                 int(session_id)
             ))
 
-            row = cursor.fetchone()
-            inserted = row is not None
+            inserted = cursor.fetchone() is not None
 
             if inserted:
                 enqueue_google_sheet_record(
                     cursor,
-                    date_text,
-                    time_text or datetime.now(KST).strftime("%H:%M:%S"),
+                    str(date_text),
+                    str(time_text or datetime.now(KST).strftime("%H:%M:%S")),
                     "가산점",
-                    user_id,
-                    username,
-                    points
+                    int(user_id),
+                    str(username),
+                    int(points)
                 )
 
         conn.commit()
@@ -2162,7 +2322,7 @@ async def delete_message_after(message, delay_seconds=60):
 
 
 async def expire_bonus_session_after(session_id, delay_seconds=300):
-    """1분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
+    """5분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
     try:
         await asyncio.sleep(delay_seconds)
         await run_db(delete_bonus_session, session_id)
@@ -2187,7 +2347,6 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
-        # DB 작업 전에 즉시 defer
         await interaction.response.defer(ephemeral=True)
 
         active_session = get_active_attendance_session(datetime.now(KST))
@@ -2202,48 +2361,20 @@ class BonusPointButton(discord.ui.Button):
         date_text, slot_text, _ = active_session
 
         try:
-            # -------------------------------------------------
-            # 현재 5분 이내에 살아있는 가산점이 있으면 재사용
-            # -------------------------------------------------
-            existing = await run_db(
-                load_active_bonus_session,
-                date_text,
-                slot_text
-            )
-
-            if existing:
-                (
-                    session_id,
-                    _,
-                    _,
-                    existing_points,
-                    existing_password,
-                    _,
-                    existing_message_id,
-                    _
-                ) = existing
-
-                return await interaction.followup.send(
-                    "🔵 **현재 가산점이 이미 활성화되어 있습니다.**\n\n"
-                    f"⭐ 가산점: **+{int(existing_points)}점**\n"
-                    f"🔐 가산점 비밀번호\n"
-                    f"```{existing_password}```\n\n"
-                    "⏰ **기존 가산점 호출은 최초 생성 시점부터 5분 동안 유효합니다.**",
-                    ephemeral=True
-                )
-
-            # -------------------------------------------------
-            # 5분이 지난 경우에만 새로운 가산점 세션 생성
-            # -------------------------------------------------
             password = generate_password()
 
-            bonus_session = await run_db(
-                save_bonus_session,
+            # 5분 이내 기존 세션이 있으면 재사용.
+            # 동시에 여러 관리자가 눌러도 같은 DB 락 안에서
+            # "조회 → 필요 시 생성"이 하나의 원자적 흐름으로 처리됩니다.
+            bonus_result = await run_db(
+                get_or_create_bonus_session_locked,
                 date_text,
                 slot_text,
                 self.points,
                 password
             )
+
+            bonus_session, created_new = bonus_result
 
             (
                 session_id,
@@ -2252,12 +2383,22 @@ class BonusPointButton(discord.ui.Button):
                 session_points,
                 session_password,
                 _,
-                _,
+                existing_message_id,
                 _
             ) = bonus_session
 
+            if not created_new:
+                return await interaction.followup.send(
+                    "🔵 **현재 가산점이 이미 활성화되어 있습니다.**\n\n"
+                    f"⭐ 가산점: **+{int(session_points)}점**\n"
+                    f"🔐 가산점 비밀번호\n"
+                    f"```{session_password}```\n\n"
+                    "⏰ **기존 가산점 호출은 최초 생성 시점부터 5분 동안 유효합니다.**",
+                    ephemeral=True
+                )
+
             # -------------------------------------------------
-            # 일반 혈맹방 가산점 패널
+            # 새 세션일 때만 일반 혈맹방 패널 생성
             # -------------------------------------------------
             attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
 
@@ -2278,16 +2419,12 @@ class BonusPointButton(discord.ui.Button):
                     bonus_message.id
                 )
 
-                # 5분 후 일반방 가산점 패널 삭제
                 asyncio.create_task(
                     delete_message_after(bonus_message, 300)
                 )
 
             # -------------------------------------------------
-            # 관리자방 비밀번호 메시지
-            #
-            # ephemeral이 아니라 실제 메시지로 보내서
-            # 5분 후 패널과 함께 자동 삭제할 수 있게 합니다.
+            # 새 세션일 때만 관리자방에 비밀번호 메시지 생성
             # -------------------------------------------------
             admin_password_message = await interaction.followup.send(
                 f"🔵 **가산점 +{int(session_points)}점 생성 완료**\n\n"
@@ -2297,12 +2434,10 @@ class BonusPointButton(discord.ui.Button):
                 wait=True
             )
 
-            # 5분 후 관리자 비밀번호 메시지 삭제
             asyncio.create_task(
                 delete_message_after(admin_password_message, 300)
             )
 
-            # 5분 후 세션 종료
             asyncio.create_task(
                 expire_bonus_session_after(session_id, 300)
             )
@@ -2548,6 +2683,18 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             )
 
 
+# =====================================================
+# 🔹 Discord Bot 인스턴스
+# =====================================================
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
+
 @bot.command(name="가산점")
 async def bonus_command(ctx):
     # 가산점은 이 명령어를 입력했을 때만 생성/표시된다.
@@ -2560,7 +2707,7 @@ async def bonus_command(ctx):
     await ctx.send(
         "🔵 **가산점 패널**\n\n"
         "부여할 가산점을 선택하세요.\n"
-        "아래 1~3점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
+        "아래 1~10점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
         "⚠️ 가산점은 이 명령어를 실행하기 전에는 "
         "일반 출석창에 나타나지 않습니다.",
         view=BonusPanelView()
@@ -3544,7 +3691,7 @@ async def on_ready():
         f"운영 시간: 03:00, 09:00, 15:00, 21:00 (KST)"
     )
     print("출석 가능시간: 각 시작 시각부터 6시간")
-    print("가산점: 호출마다 새 세션 / 호출당 5분 유효")
+    print("가산점: 5분 동안 동일 세션/비밀번호 재사용 / 5분 후 새 호출")
     print("수동 출석: !출석")
     print("공성전 출석: !공성전 / 호출 후 1시간 유효")
 
