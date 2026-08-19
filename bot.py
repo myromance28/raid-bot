@@ -407,6 +407,28 @@ def init_database():
                 )
             """)
 
+            # 공성전 출석 세션
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS siege_sessions (
+                    id SERIAL PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS siege_attendance (
+                    id SERIAL PRIMARY KEY,
+                    siege_session_id BIGINT NOT NULL,
+                    date TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(siege_session_id, user_id)
+                )
+            """)
+
             # 가산점 세션
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS bonus_sessions (
@@ -433,6 +455,47 @@ def init_database():
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS bonus_sessions_slot_idx
                 ON bonus_sessions(date, time_slot, created_at)
+            """)
+
+            # 기존 DB에 이름이 다른 UNIQUE 제약/인덱스가 남아 있어도
+            # (date, time_slot) 1개 제한을 찾아 제거합니다.
+            cursor.execute("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT c.conname
+                        FROM pg_constraint c
+                        JOIN pg_class t ON t.oid = c.conrelid
+                        WHERE t.relname = 'bonus_sessions'
+                          AND c.contype = 'u'
+                          AND pg_get_constraintdef(c.oid) ILIKE '%(date, time_slot)%'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE bonus_sessions DROP CONSTRAINT IF EXISTS %I',
+                            r.conname
+                        );
+                    END LOOP;
+                END $$;
+            """)
+
+            cursor.execute("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT indexname
+                        FROM pg_indexes
+                        WHERE tablename = 'bonus_sessions'
+                          AND indexdef ILIKE 'CREATE UNIQUE INDEX%'
+                          AND indexdef ILIKE '%(date, time_slot)%'
+                    LOOP
+                        EXECUTE format(
+                            'DROP INDEX IF EXISTS %I',
+                            r.indexname
+                        );
+                    END LOOP;
+                END $$;
             """)
 
             cursor.execute("""
@@ -478,6 +541,45 @@ def init_database():
             """)
             cursor.execute("""
                 DROP INDEX IF EXISTS bonus_attendance_date_time_slot_user_id_key
+            """)
+
+            cursor.execute("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT c.conname
+                        FROM pg_constraint c
+                        JOIN pg_class t ON t.oid = c.conrelid
+                        WHERE t.relname = 'bonus_attendance'
+                          AND c.contype = 'u'
+                          AND pg_get_constraintdef(c.oid) ILIKE '%(date, time_slot, user_id)%'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE bonus_attendance DROP CONSTRAINT IF EXISTS %I',
+                            r.conname
+                        );
+                    END LOOP;
+                END $$;
+            """)
+
+            cursor.execute("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT indexname
+                        FROM pg_indexes
+                        WHERE tablename = 'bonus_attendance'
+                          AND indexdef ILIKE 'CREATE UNIQUE INDEX%'
+                          AND indexdef ILIKE '%(date, time_slot, user_id)%'
+                    LOOP
+                        EXECUTE format(
+                            'DROP INDEX IF EXISTS %I',
+                            r.indexname
+                        );
+                    END LOOP;
+                END $$;
             """)
 
             cursor.execute("""
@@ -788,6 +890,97 @@ def delete_bonus_session(session_id):
         with conn.cursor() as cursor:
             cursor.execute(
                 "DELETE FROM bonus_sessions WHERE id=%s",
+                (int(session_id),)
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def create_siege_session(date_text, password):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO siege_sessions (date, password)
+                VALUES (%s, %s)
+                RETURNING id, date, password, created_at
+            """, (date_text, password))
+            row = cursor.fetchone()
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def load_siege_session(session_id):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, date, password, created_at
+                FROM siege_sessions
+                WHERE id=%s
+                LIMIT 1
+            """, (int(session_id),))
+            return cursor.fetchone()
+    finally:
+        release_db_connection(conn)
+
+
+def save_siege_attendance(session_id, date_text, user_id, username):
+    """공성전 한 번의 호출에서는 사용자당 1회만 출석."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO siege_attendance
+                    (siege_session_id, date, user_id, username)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (siege_session_id, user_id)
+                DO NOTHING
+                RETURNING id
+            """, (
+                int(session_id),
+                str(date_text),
+                int(user_id),
+                str(username)
+            ))
+            row = cursor.fetchone()
+            inserted = row is not None
+
+            if inserted:
+                enqueue_google_sheet_record(
+                    cursor,
+                    date_text,
+                    datetime.now(KST).strftime("%H:%M:%S"),
+                    "공성출석",
+                    user_id,
+                    username,
+                    0
+                )
+
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def delete_siege_session(session_id):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM siege_sessions WHERE id=%s",
                 (int(session_id),)
             )
         conn.commit()
@@ -1464,6 +1657,139 @@ class BossPanelView(discord.ui.View):
 # =====================================================
 # 🔹 출석 패널
 # =====================================================
+class SiegeAttendanceModal(
+    discord.ui.Modal,
+    title="🏰 공성전 출석 비밀번호"
+):
+    password_input = discord.ui.TextInput(
+        label="공성전 비밀번호",
+        placeholder="관리자 전용방에 표시된 번호를 입력하세요.",
+        min_length=4,
+        max_length=4,
+        required=True
+    )
+
+    def __init__(self, session_id):
+        super().__init__()
+        self.session_id = int(session_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.channel_id != ATTENDANCE_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ 일반 혈맹 출석창에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            session = await run_db(load_siege_session, self.session_id)
+            if not session:
+                return await interaction.followup.send(
+                    "❌ 이 공성전 출석 호출은 이미 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            session_id, date_text, stored_password, created_at = session
+            now = datetime.now(KST)
+
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=KST)
+            else:
+                created_at = created_at.astimezone(KST)
+
+            if now >= created_at + timedelta(hours=1):
+                return await interaction.followup.send(
+                    "❌ 공성전 출석 가능시간 1시간이 종료되었습니다.",
+                    ephemeral=True
+                )
+
+            if str(self.password_input.value).strip() != str(stored_password):
+                return await interaction.followup.send(
+                    "❌ 공성전 비밀번호가 틀렸습니다.",
+                    ephemeral=True
+                )
+
+            inserted = await run_db(
+                save_siege_attendance,
+                session_id,
+                date_text,
+                interaction.user.id,
+                interaction.user.display_name
+            )
+
+            if not inserted:
+                return await interaction.followup.send(
+                    "⚠️ 이미 이번 공성전 출석을 완료하셨습니다.",
+                    ephemeral=True
+                )
+
+            await interaction.followup.send(
+                f"🏰 **공성전 출석 완료!**\n"
+                f"👤 {interaction.user.display_name}\n"
+                "✅ 출석",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            print(f"[공성전 출석 오류] {type(e).__name__}: {e}")
+            try:
+                await interaction.followup.send(
+                    "❌ 공성전 출석 처리 중 오류가 발생했습니다.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+
+
+class SiegeAttendanceButton(discord.ui.Button):
+    def __init__(self, session_id):
+        super().__init__(
+            label="공성전",
+            style=discord.ButtonStyle.warning,
+            custom_id=f"raid_siege_attendance_{int(session_id)}"
+        )
+        self.session_id = int(session_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            SiegeAttendanceModal(self.session_id)
+        )
+
+
+class SiegeAttendanceView(discord.ui.View):
+    def __init__(self, session_id):
+        super().__init__(timeout=3600)
+        self.add_item(SiegeAttendanceButton(session_id))
+
+
+async def delete_siege_message_after(message, delay_seconds=3600):
+    try:
+        await asyncio.sleep(delay_seconds)
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            print("[공성전 메시지 자동삭제 실패] Discord 권한 부족")
+        except discord.HTTPException as e:
+            print(f"[공성전 메시지 자동삭제 실패] HTTP 오류: {e}")
+        except Exception as e:
+            print(f"[공성전 메시지 자동삭제 오류] {type(e).__name__}: {e}")
+    except asyncio.CancelledError:
+        raise
+
+
+async def expire_siege_session_after(session_id, delay_seconds=3600):
+    try:
+        await asyncio.sleep(delay_seconds)
+        await run_db(delete_siege_session, session_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[공성전 세션 자동삭제 오류] {type(e).__name__}: {e}")
+
+
 class BonusPasswordModal(
     discord.ui.Modal,
     title="🔵 가산점 비밀번호"
@@ -1715,7 +2041,8 @@ class BonusPointButton(discord.ui.Button):
             print(f"[가산점 생성 오류] {type(e).__name__}: {e}")
             try:
                 await interaction.followup.send(
-                    "❌ 가산점 생성 중 오류가 발생했습니다.",
+                    "❌ 가산점 생성 중 오류가 발생했습니다.\n"
+                    f"오류: `{type(e).__name__}`",
                     ephemeral=True
                 )
             except Exception:
@@ -2116,7 +2443,6 @@ bot = commands.Bot(
 
 # 봇 시작 시 출석 버튼을 Persistent View로 등록
 bot.add_view(AttendanceView())
-bot.add_view(StandaloneBonusView())
 
 
 # =====================================================
@@ -2264,11 +2590,67 @@ async def bonus_command(ctx):
     await ctx.send(
         "🔵 **가산점 패널**\n\n"
         "부여할 가산점을 선택하세요.\n"
-        "아래 1~5점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
+        "아래 1~3점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
         "⚠️ 가산점은 이 명령어를 실행하기 전에는 "
         "일반 출석창에 나타나지 않습니다.",
         view=BonusPanelView()
     )
+
+
+@bot.command(name="공성전")
+async def siege_command(ctx):
+    """관리자방에서 공성전 출석 세션을 1시간 동안 생성합니다."""
+    if not is_admin_channel(ctx):
+        return await ctx.send(
+            "❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다."
+        )
+
+    date_text = datetime.now(KST).strftime("%Y-%m-%d")
+    password = generate_password()
+
+    try:
+        session = await run_db(create_siege_session, date_text, password)
+        session_id, _, session_password, _ = session
+
+        admin_message = await ctx.send(
+            "🏰 **공성전 출석 시작**\n\n"
+            f"🔐 공성전 비밀번호\n"
+            f"```{session_password}```\n\n"
+            "⏰ **호출 후 1시간 동안 유효합니다.**"
+        )
+        asyncio.create_task(
+            delete_siege_message_after(admin_message, 3600)
+        )
+
+        attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+        if attendance_channel is None:
+            await ctx.send("❌ 일반 혈맹 출석창을 찾을 수 없습니다.")
+            return
+
+        attendance_message = await attendance_channel.send(
+            "🏰 **공성전 출석**\n"
+            "공성전에 참여하신 분은 아래 **노란색 버튼**을 눌러 출석해주세요.\n"
+            "⏰ **호출 후 1시간 동안 유효합니다.**",
+            view=SiegeAttendanceView(session_id)
+        )
+
+        asyncio.create_task(
+            delete_siege_message_after(attendance_message, 3600)
+        )
+        asyncio.create_task(
+            expire_siege_session_after(session_id, 3600)
+        )
+
+        print(
+            f"[공성전 생성] id={session_id} / "
+            f"date={date_text} / password={session_password}"
+        )
+
+    except Exception as e:
+        print(f"[공성전 생성 오류] {type(e).__name__}: {e}")
+        await ctx.send(
+            f"❌ 공성전 생성 중 오류가 발생했습니다.\n```{e}```"
+        )
 
 
 @bot.command(name="보스추가", aliases=["보스 추가"])
@@ -3194,6 +3576,7 @@ async def on_ready():
     print("출석 가능시간: 각 시작 시각부터 6시간")
     print("가산점: 호출마다 새 세션 / 호출당 1분 유효")
     print("수동 출석: !출석")
+    print("공성전 출석: !공성전 / 호출 후 1시간 유효")
 
 
 # =====================================================
