@@ -930,7 +930,7 @@ def load_bonus_session(session_id):
 
 
 def save_bonus_session(date_text, slot_text, points, password):
-    """!가산점 호출마다 새로운 1분짜리 세션 생성."""
+    """!가산점 호출마다 새로운 5분짜리 세션 생성."""
     conn = get_db_connection()
     try:
         created_at_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -981,7 +981,7 @@ def update_bonus_message_id(session_id, message_id):
 
 
 def delete_bonus_session(session_id):
-    """1분짜리 세션만 삭제. bonus_attendance 기록은 유지."""
+    """5분짜리 세션만 삭제. bonus_attendance 기록은 유지."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -1197,7 +1197,7 @@ def save_bonus_attendance_atomic(
                     return "expired", None
 
             now=datetime.now(KST)
-            if now >= created_at_kst + timedelta(minutes=1):
+            if now >= created_at_kst + timedelta(minutes=5):
                 conn.rollback()
                 return "expired", None
 
@@ -1580,7 +1580,7 @@ async def send_boss_panel():
 
 class DropDeleteConfirmView(discord.ui.View):
     def __init__(self, drop_id, drop_text):
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)
         self.drop_id = drop_id
         self.drop_text = drop_text
 
@@ -1808,7 +1808,7 @@ class DropResetConfirmModal(discord.ui.Modal, title="⚠️ 득템 전체 초기
 
 class DropResetView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)
 
     @discord.ui.button(
         label="⚠️ 득템 전체 초기화",
@@ -2098,11 +2098,11 @@ class BonusButton(discord.ui.Button):
 class StandaloneBonusView(discord.ui.View):
     """특정 !가산점 호출에 연결된 1분짜리 버튼."""
     def __init__(self, session_id):
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)
         self.add_item(BonusButton(session_id))
 
 
-async def delete_message_after(message, delay_seconds=60):
+async def delete_message_after(message, delay_seconds=300):
     """1분 후 가산점 메시지를 삭제합니다."""
     try:
         await asyncio.sleep(delay_seconds)
@@ -2120,8 +2120,8 @@ async def delete_message_after(message, delay_seconds=60):
         raise
 
 
-async def expire_bonus_session_after(session_id, delay_seconds=60):
-    """1분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
+async def expire_bonus_session_after(session_id, delay_seconds=300):
+    """5분 후 호출 세션만 삭제하고, 지급 기록은 그대로 둡니다."""
     try:
         await asyncio.sleep(delay_seconds)
         await run_db(delete_bonus_session, session_id)
@@ -2172,7 +2172,7 @@ class BonusPointButton(discord.ui.Button):
                     "🔵 **가산점 패널**\n"
                     f"⭐ 가산점: **+{self.points}점**\n"
                     "아래 파란색 버튼을 눌러 비밀번호를 입력하세요.\n"
-                    "⏰ **이 호출은 1분 동안만 유효합니다.**",
+                    "⏰ **이 호출은 5분 동안만 유효합니다.**",
                     view=StandaloneBonusView(session_id)
                 )
                 bonus_message_ids.add(bonus_message.id)
@@ -2183,7 +2183,7 @@ class BonusPointButton(discord.ui.Button):
                 f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
                 f"🔐 가산점 비밀번호\n"
                 f"```{session_password}```\n\n"
-                "⏰ **이 호출은 1분 동안만 유효합니다.**",
+                "⏰ **이 호출은 5분 동안만 유효합니다.**",
                 ephemeral=True
             )
             asyncio.create_task(expire_bonus_session_after(session_id,60))
@@ -2199,7 +2199,7 @@ class BonusPointButton(discord.ui.Button):
 
 class BonusPanelView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)
 
         for points in range(1, 11):
             self.add_item(BonusPointButton(points))
@@ -3208,7 +3208,7 @@ async def db_reset(ctx):
 
 class DBResetConfirmView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)
 
     @discord.ui.button(
         label="⚠️ 초기화 진행",
