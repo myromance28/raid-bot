@@ -3717,6 +3717,194 @@ async def discord_gateway_watchdog():
 # =====================================================
 # 🔹 봇 시작
 # =====================================================
+# =====================================================
+# 🔹 복구된 자동 출석/채널 정리 태스크
+# =====================================================
+# =====================================================
+# 🔹 자동 출석 패널 + 비밀번호
+# =====================================================
+@tasks.loop(seconds=10)
+async def automatic_attendance_panel():
+    """
+    현재 출석 시간대의 세션이 없으면 생성하고,
+    정각을 놓쳐도 유효 시간 안에서 패널을 보장합니다.
+    """
+    global current_password
+    global current_date
+    global current_slot
+    global last_panel_key
+
+    now = datetime.now(KST)
+
+    if TEST_MODE:
+        date_text = now.strftime("%Y-%m-%d")
+        slot_text = get_test_session_slot(now)
+        session_start = get_test_session_start(now)
+        session_end = session_start + timedelta(minutes=TEST_INTERVAL_MINUTES)
+    else:
+        active_session = get_active_attendance_session(now)
+        if active_session is None:
+            return
+        date_text, slot_text, session_start = active_session
+        session_end = session_start + timedelta(hours=6)
+
+    # DB에서 해당 시간대 세션을 먼저 확인합니다.
+    def load_session_with_panel():
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT date, time_slot, password, panel_sent
+                    FROM attendance_sessions
+                    WHERE date=%s AND time_slot=%s
+                    LIMIT 1
+                """, (date_text, slot_text))
+                return cursor.fetchone()
+        finally:
+            release_db_connection(conn)
+
+    session = await run_db(load_session_with_panel)
+
+    if session:
+        current_date, current_slot, current_password, panel_sent = session
+    else:
+        password = generate_password()
+
+        def create_session_if_missing():
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO attendance_sessions
+                            (date, time_slot, password, panel_sent)
+                        VALUES (%s, %s, %s, FALSE)
+                        ON CONFLICT (date, time_slot) DO NOTHING
+                        RETURNING date, time_slot, password, panel_sent
+                    """, (date_text, slot_text, password))
+                    row = cursor.fetchone()
+
+                    if row is None:
+                        cursor.execute("""
+                            SELECT date, time_slot, password, panel_sent
+                            FROM attendance_sessions
+                            WHERE date=%s AND time_slot=%s
+                            LIMIT 1
+                        """, (date_text, slot_text))
+                        row = cursor.fetchone()
+
+                    conn.commit()
+                    return row
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                release_db_connection(conn)
+
+        session = await run_db(create_session_if_missing)
+        if not session:
+            return
+        current_date, current_slot, current_password, panel_sent = session
+
+    # 현재 세션은 DB가 진실의 원천입니다.
+    panel_key = f"{date_text}_{slot_text}"
+    if panel_sent or last_panel_key == panel_key:
+        return
+
+    attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
+    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+
+    if not attendance_channel or not admin_channel:
+        print("[자동 패널 실패] 출석/관리자 채널을 찾을 수 없습니다.")
+        return
+
+    validity_text = f"{TEST_INTERVAL_MINUTES}분" if TEST_MODE else "3시간"
+
+    try:
+        await attendance_channel.send(
+            f"📢 **출석 시간입니다!**\n"
+            f"🕒 {now.strftime('%H:%M:%S')} 출석\n\n"
+            "아래 버튼을 눌러 출석해주세요.\n"
+            "출석 시 **1점**이 지급됩니다.\n"
+            f"⏰ 유효시간: {validity_text}",
+            view=AttendanceView()
+        )
+
+        await admin_channel.send(
+            f"🔐 **출석 비밀번호**\n\n"
+            f"```{current_password}```\n\n"
+            f"🕒 출석 시간: {now.strftime('%H:%M:%S')}\n"
+            f"⏰ 유효시간: {validity_text}\n"
+            "⚠️ 이 번호는 혈맹원에게 알려주세요."
+        )
+
+        await send_boss_panel()
+
+        def mark_panel_sent():
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE attendance_sessions
+                        SET panel_sent=TRUE
+                        WHERE date=%s AND time_slot=%s
+                    """, (date_text, slot_text))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                release_db_connection(conn)
+
+        await run_db(mark_panel_sent)
+        last_panel_key = panel_key
+
+        print(
+            f"[자동 출석] {date_text} [세션 {slot_text}] "
+            f"비밀번호={current_password} / 패널 생성 완료"
+        )
+
+    except Exception as e:
+        # 패널 전송 중 하나라도 실패하면 panel_sent를 TRUE로 만들지 않습니다.
+        # 다음 10초 주기에 다시 시도할 수 있습니다.
+        print(f"[자동 출석 패널 오류] {type(e).__name__}: {e}")
+
+
+# =====================================================
+# 🔹 3시간 후 채널 전체 초기화
+# =====================================================
+@tasks.loop(seconds=10)
+async def automatic_channel_cleanup():
+
+    now = datetime.now(KST)
+
+    if TEST_MODE:
+        # 가산점은 호출별 1분 세션이므로 별도 6시간 종료 처리를 하지 않습니다.
+        return
+
+    # 운영 모드:
+    # 채팅방 초기화: 00:00 / 06:00 / 12:00 / 18:00
+    # 일반 혈맹방과 관리자방의 채팅을 함께 초기화합니다.
+    cleanup_hours = {0, 6, 12, 18}
+
+    if now.hour not in cleanup_hours:
+        return
+
+    # 정각의 첫 1분 안에 한 번만 실행합니다.
+    if now.minute > 0:
+        return
+
+    await clear_both_channels()
+
+    print(
+        f"[자동 채널 초기화] "
+        f"{now.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+
+
+# Google Sheets 워커 상태
+google_sheet_worker_task = None
+
 @bot.event
 async def on_ready():
     global current_date, current_slot, current_password
