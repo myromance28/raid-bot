@@ -795,6 +795,77 @@ def enqueue_google_sheet_record(
     return cursor.rowcount > 0
 
 
+def save_attendance_atomic(
+    entered_password,
+    user_id,
+    username
+):
+    """일반 출석을 세션 확인부터 기록까지 하나의 DB 트랜잭션으로 처리합니다."""
+    conn = get_db_connection()
+    try:
+        now = datetime.now(KST)
+        active_session = get_active_attendance_session(now)
+
+        if active_session is None:
+            conn.rollback()
+            return "expired"
+
+        date_text, slot_text, session_start = active_session
+
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT password
+                FROM attendance_sessions
+                WHERE date=%s AND time_slot=%s
+                LIMIT 1
+            """, (date_text, slot_text))
+            session = cursor.fetchone()
+
+            if not session:
+                conn.rollback()
+                return "missing_session"
+
+            if now >= session_start + timedelta(hours=6):
+                conn.rollback()
+                return "expired"
+
+            if str(entered_password).strip() != str(session[0]):
+                conn.rollback()
+                return "password"
+
+            cursor.execute("""
+                INSERT INTO attendance_v2
+                    (date, time_slot, user_id, username, points)
+                VALUES (%s, %s, %s, %s, 1)
+                ON CONFLICT (date, time_slot, user_id)
+                DO NOTHING
+                RETURNING id
+            """, (date_text, slot_text, int(user_id), str(username)))
+
+            if cursor.fetchone() is None:
+                conn.rollback()
+                return "duplicate"
+
+            enqueue_google_sheet_record(
+                cursor,
+                date_text,
+                now.strftime("%H:%M:%S"),
+                "출석",
+                user_id,
+                username,
+                1
+            )
+
+        conn.commit()
+        return "success"
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
 def save_attendance(date, slot, user_id, username):
     """
     출석 중복 확인 SELECT를 별도로 하지 않고 INSERT 한 번으로 처리합니다.
@@ -859,12 +930,20 @@ def load_bonus_session(session_id):
 
 
 def save_bonus_session(date_text, slot_text, points, password):
-    """!가산점 호출마다 새로운 1분짜리 세션을 생성."""
+    """!가산점 호출마다 새로운 1분짜리 세션 생성."""
     conn = get_db_connection()
     try:
         created_at_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
-
         with conn.cursor() as cursor:
+            # 구버전 DB도 이 호출에서 바로 보정합니다.
+            cursor.execute("""
+                ALTER TABLE bonus_sessions
+                ADD COLUMN IF NOT EXISTS created_at_kst TEXT
+            """)
+            cursor.execute("""
+                ALTER TABLE bonus_sessions
+                ADD COLUMN IF NOT EXISTS message_id BIGINT
+            """)
             cursor.execute("""
                 INSERT INTO bonus_sessions
                     (date, time_slot, points, password, created_at_kst)
@@ -872,17 +951,11 @@ def save_bonus_session(date_text, slot_text, points, password):
                 RETURNING id, date, time_slot, points, password,
                           created_at, message_id, created_at_kst
             """, (
-                date_text,
-                slot_text,
-                points,
-                password,
-                created_at_kst
+                date_text, slot_text, int(points), password, created_at_kst
             ))
-            row = cursor.fetchone()
-
+            row=cursor.fetchone()
         conn.commit()
         return row
-
     except Exception:
         conn.rollback()
         raise
@@ -1075,6 +1148,88 @@ def has_bonus_attendance(date_text, slot_text, user_id):
                 LIMIT 1
             """, (date_text, slot_text, user_id))
             return cursor.fetchone() is not None
+    finally:
+        release_db_connection(conn)
+
+
+def save_bonus_attendance_atomic(
+    session_id,
+    entered_password,
+    active_date,
+    active_slot,
+    user_id,
+    username,
+    time_text
+):
+    """가산점 제출 전체를 하나의 DB 트랜잭션으로 처리."""
+    conn=get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, date, time_slot, points, password, created_at_kst
+                FROM bonus_sessions
+                WHERE id=%s
+                LIMIT 1
+            """,(int(session_id),))
+            session=cursor.fetchone()
+
+            if not session:
+                conn.rollback()
+                return "expired", None
+
+            db_session_id,date_text,slot_text,points,stored_password,created_at_kst_text=session
+
+            if str(date_text)!=str(active_date) or str(slot_text)!=str(active_slot):
+                conn.rollback()
+                return "slot", None
+
+            try:
+                created_at_kst=datetime.strptime(
+                    str(created_at_kst_text), "%Y-%m-%d %H:%M:%S.%f"
+                ).replace(tzinfo=KST)
+            except Exception:
+                try:
+                    created_at_kst=datetime.strptime(
+                        str(created_at_kst_text), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=KST)
+                except Exception:
+                    conn.rollback()
+                    return "expired", None
+
+            now=datetime.now(KST)
+            if now >= created_at_kst + timedelta(minutes=1):
+                conn.rollback()
+                return "expired", None
+
+            if str(entered_password).strip()!=str(stored_password):
+                conn.rollback()
+                return "password", None
+
+            cursor.execute("""
+                INSERT INTO bonus_attendance
+                    (date, time_slot, points, user_id, username, bonus_session_id)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (bonus_session_id,user_id)
+                DO NOTHING
+                RETURNING id
+            """,(str(date_text),str(slot_text),int(points),int(user_id),
+                 str(username),int(db_session_id)))
+
+            if cursor.fetchone() is None:
+                conn.rollback()
+                return "duplicate", int(points)
+
+            enqueue_google_sheet_record(
+                cursor,str(date_text),str(time_text),"가산점",
+                int(user_id),str(username),int(points)
+            )
+
+        conn.commit()
+        return "success", int(points)
+
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_db_connection(conn)
 
@@ -1860,7 +2015,7 @@ class BonusPasswordModal(
 
     def __init__(self, session_id):
         super().__init__()
-        self.session_id = int(session_id)
+        self.session_id=int(session_id)
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.channel_id != ATTENDANCE_CHANNEL_ID:
@@ -1872,94 +2027,51 @@ class BonusPasswordModal(
         await interaction.response.defer(ephemeral=True)
 
         try:
-            bonus_session = await run_db(load_bonus_session, self.session_id)
-
-            if not bonus_session:
-                return await interaction.followup.send(
-                    "❌ 이 가산점 호출은 이미 종료되었습니다.",
-                    ephemeral=True
-                )
-
-            (
-                session_id,
-                date_text,
-                slot_text,
-                bonus_points,
-                stored_password,
-                created_at,
-                _,
-                created_at_kst_text
-            ) = bonus_session
-
-            now = datetime.now(KST)
-            active_session = get_active_attendance_session(now)
-
+            active_session=get_active_attendance_session(datetime.now(KST))
             if active_session is None:
                 return await interaction.followup.send(
-                    "❌ 현재 출석 시간대가 종료되었습니다.",
+                    "❌ 현재 출석 시간대가 아닙니다.",
                     ephemeral=True
                 )
 
-            active_date, active_slot, _ = active_session
+            active_date,active_slot,_=active_session
 
-            if str(date_text) != str(active_date) or str(slot_text) != str(active_slot):
-                return await interaction.followup.send(
-                    "❌ 현재 출석 시간대의 가산점이 아닙니다.",
-                    ephemeral=True
-                )
-
-            try:
-                created_at_kst = datetime.strptime(
-                    str(created_at_kst_text),
-                    "%Y-%m-%d %H:%M:%S.%f"
-                ).replace(tzinfo=KST)
-            except ValueError:
-                created_at_kst = datetime.strptime(
-                    str(created_at_kst_text),
-                    "%Y-%m-%d %H:%M:%S"
-                ).replace(tzinfo=KST)
-
-            if now >= created_at_kst + timedelta(minutes=1):
-                return await interaction.followup.send(
-                    "❌ 이 가산점 호출은 1분이 지나 종료되었습니다.",
-                    ephemeral=True
-                )
-
-            if str(self.password_input.value).strip() != str(stored_password):
-                return await interaction.followup.send(
-                    "❌ 가산점 비밀번호가 틀렸습니다.",
-                    ephemeral=True
-                )
-
-            inserted = await run_db(
-                save_bonus_attendance,
-                session_id,
-                date_text,
-                slot_text,
-                int(bonus_points),
+            result,points=await run_db(
+                save_bonus_attendance_atomic,
+                self.session_id,
+                str(self.password_input.value).strip(),
+                active_date,
+                active_slot,
                 interaction.user.id,
                 interaction.user.display_name,
-                now.strftime("%H:%M:%S")
+                datetime.now(KST).strftime("%H:%M:%S")
             )
 
-            if not inserted:
+            if result=="success":
                 return await interaction.followup.send(
-                    "⚠️ 이번 가산점 호출에서는 이미 점수를 받으셨습니다.",
+                    f"🔵 **가산점 +{points}점 지급 완료!**\n"
+                    f"👤 {interaction.user.display_name}\n"
+                    f"⭐ +{points}점",
                     ephemeral=True
                 )
 
-            await interaction.followup.send(
-                f"🔵 **가산점 +{int(bonus_points)}점 지급 완료!**\n"
-                f"👤 {interaction.user.display_name}\n"
-                f"⭐ +{int(bonus_points)}점",
-                ephemeral=True
-            )
+            if result=="password":
+                message="❌ 가산점 비밀번호가 틀렸습니다."
+            elif result=="duplicate":
+                message="⚠️ 이번 가산점 호출에서는 이미 점수를 받으셨습니다."
+            elif result=="slot":
+                message="❌ 현재 출석 시간대의 가산점이 아닙니다."
+            else:
+                message="❌ 이 가산점 호출은 1분이 지나 종료되었습니다."
+
+            await interaction.followup.send(message,ephemeral=True)
 
         except Exception as e:
             print(f"[가산점 처리 오류] {type(e).__name__}: {e}")
             try:
                 await interaction.followup.send(
-                    "❌ 가산점 처리 중 오류가 발생했습니다.",
+                    "❌ 가산점 처리 중 오류가 발생했습니다.\n"
+                    f"오류: `{type(e).__name__}`",
                     ephemeral=True
                 )
             except Exception:
@@ -2025,7 +2137,7 @@ class BonusPointButton(discord.ui.Button):
             label=f"{points}점",
             style=discord.ButtonStyle.primary
         )
-        self.points = points
+        self.points=points
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin_channel(interaction):
@@ -2034,82 +2146,55 @@ class BonusPointButton(discord.ui.Button):
                 ephemeral=True
             )
 
-        now = datetime.now(KST)
-        active_session = get_active_attendance_session(now)
+        await interaction.response.defer(ephemeral=True)
 
+        now=datetime.now(KST)
+        active_session=get_active_attendance_session(now)
         if active_session is None:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⚠️ 현재는 출석 시간대가 아닙니다.\n"
                 "출석 시간은 **03:00 / 09:00 / 15:00 / 21:00**입니다.",
                 ephemeral=True
             )
 
-        date_text, slot_text, _ = active_session
-        password = generate_password()
+        date_text,slot_text,_=active_session
+        password=generate_password()
 
         try:
-            # 호출할 때마다 새로운 세션 생성
-            bonus_session = await run_db(
-                save_bonus_session,
-                date_text,
-                slot_text,
-                self.points,
-                password
+            bonus_session=await run_db(
+                save_bonus_session,date_text,slot_text,self.points,password
             )
+            (session_id,_,_,_,session_password,_,_,_)=bonus_session
 
-            (
-                session_id,
-                _,
-                _,
-                _,
-                session_password,
-                _,
-                _,
-                _
-            ) = bonus_session
-
-            await interaction.response.send_message(
-                f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
-                f"🔐 가산점 비밀번호\n"
-                f"```{session_password}```\n\n"
-                "⏰ **이 호출은 1분 동안만 유효합니다.**"
-            )
-
-            admin_bonus_message = await interaction.original_response()
-            asyncio.create_task(delete_message_after(admin_bonus_message, 60))
-            asyncio.create_task(expire_bonus_session_after(session_id, 60))
-
-            attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
-
+            attendance_channel=bot.get_channel(ATTENDANCE_CHANNEL_ID)
             if attendance_channel is not None:
-                bonus_message = await attendance_channel.send(
+                bonus_message=await attendance_channel.send(
                     "🔵 **가산점 패널**\n"
                     f"⭐ 가산점: **+{self.points}점**\n"
                     "아래 파란색 버튼을 눌러 비밀번호를 입력하세요.\n"
                     "⏰ **이 호출은 1분 동안만 유효합니다.**",
                     view=StandaloneBonusView(session_id)
                 )
-
                 bonus_message_ids.add(bonus_message.id)
+                await run_db(update_bonus_message_id,session_id,bonus_message.id)
+                asyncio.create_task(delete_message_after(bonus_message,60))
 
-                await run_db(
-                    update_bonus_message_id,
-                    session_id,
-                    bonus_message.id
-                )
-
-                asyncio.create_task(delete_message_after(bonus_message, 60))
+            await interaction.followup.send(
+                f"🔵 **가산점 +{self.points}점 생성 완료**\n\n"
+                f"🔐 가산점 비밀번호\n"
+                f"```{session_password}```\n\n"
+                "⏰ **이 호출은 1분 동안만 유효합니다.**",
+                ephemeral=True
+            )
+            asyncio.create_task(expire_bonus_session_after(session_id,60))
 
         except Exception as e:
             print(f"[가산점 생성 오류] {type(e).__name__}: {e}")
-            try:
-                await interaction.followup.send(
-                    "❌ 가산점 생성 중 오류가 발생했습니다.\n"
-                    f"오류: `{type(e).__name__}`",
-                    ephemeral=True
-                )
-            except Exception:
-                pass
+            await interaction.followup.send(
+                "❌ 가산점 생성 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`",
+                ephemeral=True
+            )
 
 
 class BonusPanelView(discord.ui.View):
@@ -2154,7 +2239,6 @@ class AttendancePasswordModal(
     discord.ui.Modal,
     title="🔐 출석 비밀번호"
 ):
-
     password_input = discord.ui.TextInput(
         label="4자리 비밀번호",
         placeholder="관리자 전용방에 표시된 4자리 번호를 입력하세요.",
@@ -2170,82 +2254,33 @@ class AttendancePasswordModal(
                 ephemeral=True
             )
 
+        # 150명 동시 제출에서도 interaction timeout을 피하도록 즉시 defer합니다.
         await interaction.response.defer(ephemeral=True)
 
         try:
-            now = datetime.now(KST)
-            active_session = get_active_attendance_session(now)
-
-            if active_session is None:
-                return await interaction.followup.send(
-                    "❌ 현재 출석 가능한 시간이 아닙니다.",
-                    ephemeral=True
-                )
-
-            date_text, slot_text, session_start = active_session
-
-            def load_session_for_attendance():
-                conn = get_db_connection()
-                try:
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            SELECT date, time_slot, password
-                            FROM attendance_sessions
-                            WHERE date=%s AND time_slot=%s
-                            LIMIT 1
-                        """, (date_text, slot_text))
-                        return cursor.fetchone()
-                finally:
-                    release_db_connection(conn)
-
-            session = await run_db(load_session_for_attendance)
-
-            if not session:
-                return await interaction.followup.send(
-                    "❌ 현재 출석 세션이 아직 생성되지 않았습니다.\n"
-                    "잠시 후 다시 시도해주세요.",
-                    ephemeral=True
-                )
-
-            stored_date, stored_slot, stored_password = session
-
-            if stored_date != date_text or str(stored_slot) != str(slot_text):
-                return await interaction.followup.send(
-                    "❌ 현재 출석 세션이 아닙니다.",
-                    ephemeral=True
-                )
-
-            if now >= session_start + timedelta(hours=6):
-                return await interaction.followup.send(
-                    "❌ 출석 가능 시간이 종료되었습니다.",
-                    ephemeral=True
-                )
-
-            entered = str(self.password_input.value).strip()
-            if entered != str(stored_password):
-                return await interaction.followup.send(
-                    "❌ 비밀번호가 틀렸습니다.",
-                    ephemeral=True
-                )
-
-            inserted = await run_db(
-                save_attendance,
-                date_text,
-                slot_text,
+            result = await run_db(
+                save_attendance_atomic,
+                str(self.password_input.value).strip(),
                 interaction.user.id,
                 interaction.user.display_name
             )
 
-            if not inserted:
-                return await interaction.followup.send(
-                    "⚠️ 이미 이번 출석에 참여하셨습니다.",
-                    ephemeral=True
-                )
+            messages = {
+                "success": (
+                    f"✅ **출석 완료!**\n"
+                    f"👤 {interaction.user.display_name}"
+                ),
+                "expired": "❌ 현재 출석 가능한 시간이 아닙니다.",
+                "missing_session": (
+                    "❌ 현재 출석 세션이 아직 생성되지 않았습니다.\n"
+                    "잠시 후 다시 시도해주세요."
+                ),
+                "password": "❌ 비밀번호가 틀렸습니다.",
+                "duplicate": "⚠️ 이미 이번 출석을 완료하셨습니다."
+            }
 
-            await interaction.followup.send(
-                f"✅ 출석 완료!\n"
-                f"👤 {interaction.user.display_name}\n"
-                f"⭐ 1점이 지급되었습니다.",
+            return await interaction.followup.send(
+                messages.get(result, "❌ 출석 처리에 실패했습니다."),
                 ephemeral=True
             )
 
@@ -2254,263 +2289,13 @@ class AttendancePasswordModal(
             try:
                 await interaction.followup.send(
                     "❌ 출석 처리 중 오류가 발생했습니다.\n"
-                    "잠시 후 다시 시도해주세요.",
+                    f"오류: `{type(e).__name__}`",
                     ephemeral=True
                 )
             except Exception:
                 pass
 
 
-
-# =====================================================
-# 🔹 채널 전체 메시지 삭제
-# =====================================================
-async def clear_channel(channel):
-    try:
-        deleted = await channel.purge(
-            limit=None,
-            bulk=False
-        )
-
-        print(
-            f"[채널 초기화] #{channel.name} : "
-            f"{len(deleted)}개 삭제"
-        )
-
-    except discord.Forbidden:
-        print(
-            f"[채널 초기화 실패] #{channel.name} "
-            f"권한 부족"
-        )
-
-    except discord.HTTPException as e:
-        print(
-            f"[채널 초기화 실패] #{channel.name}: {e}"
-        )
-
-    except Exception as e:
-        print(
-            f"[채널 초기화 오류] #{channel.name}: {e}"
-        )
-
-
-async def clear_both_channels():
-    attendance_channel = bot.get_channel(
-        ATTENDANCE_CHANNEL_ID
-    )
-
-    admin_channel = bot.get_channel(
-        ADMIN_CHANNEL_ID
-    )
-
-    if attendance_channel:
-        await clear_channel(attendance_channel)
-
-    if admin_channel:
-        await clear_channel(admin_channel)
-
-
-# =====================================================
-# 🔹 자동 출석 패널 + 비밀번호
-# =====================================================
-@tasks.loop(seconds=10)
-async def automatic_attendance_panel():
-    """
-    현재 출석 시간대의 세션이 없으면 생성하고,
-    정각을 놓쳐도 유효 시간 안에서 패널을 보장합니다.
-    """
-    global current_password
-    global current_date
-    global current_slot
-    global last_panel_key
-
-    now = datetime.now(KST)
-
-    if TEST_MODE:
-        date_text = now.strftime("%Y-%m-%d")
-        slot_text = get_test_session_slot(now)
-        session_start = get_test_session_start(now)
-        session_end = session_start + timedelta(minutes=TEST_INTERVAL_MINUTES)
-    else:
-        active_session = get_active_attendance_session(now)
-        if active_session is None:
-            return
-        date_text, slot_text, session_start = active_session
-        session_end = session_start + timedelta(hours=6)
-
-    # DB에서 해당 시간대 세션을 먼저 확인합니다.
-    def load_session_with_panel():
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT date, time_slot, password, panel_sent
-                    FROM attendance_sessions
-                    WHERE date=%s AND time_slot=%s
-                    LIMIT 1
-                """, (date_text, slot_text))
-                return cursor.fetchone()
-        finally:
-            release_db_connection(conn)
-
-    session = await run_db(load_session_with_panel)
-
-    if session:
-        current_date, current_slot, current_password, panel_sent = session
-    else:
-        password = generate_password()
-
-        def create_session_if_missing():
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO attendance_sessions
-                            (date, time_slot, password, panel_sent)
-                        VALUES (%s, %s, %s, FALSE)
-                        ON CONFLICT (date, time_slot) DO NOTHING
-                        RETURNING date, time_slot, password, panel_sent
-                    """, (date_text, slot_text, password))
-                    row = cursor.fetchone()
-
-                    if row is None:
-                        cursor.execute("""
-                            SELECT date, time_slot, password, panel_sent
-                            FROM attendance_sessions
-                            WHERE date=%s AND time_slot=%s
-                            LIMIT 1
-                        """, (date_text, slot_text))
-                        row = cursor.fetchone()
-
-                    conn.commit()
-                    return row
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                release_db_connection(conn)
-
-        session = await run_db(create_session_if_missing)
-        if not session:
-            return
-        current_date, current_slot, current_password, panel_sent = session
-
-    # 현재 세션은 DB가 진실의 원천입니다.
-    panel_key = f"{date_text}_{slot_text}"
-    if panel_sent or last_panel_key == panel_key:
-        return
-
-    attendance_channel = bot.get_channel(ATTENDANCE_CHANNEL_ID)
-    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
-
-    if not attendance_channel or not admin_channel:
-        print("[자동 패널 실패] 출석/관리자 채널을 찾을 수 없습니다.")
-        return
-
-    validity_text = f"{TEST_INTERVAL_MINUTES}분" if TEST_MODE else "3시간"
-
-    try:
-        await attendance_channel.send(
-            f"📢 **출석 시간입니다!**\n"
-            f"🕒 {now.strftime('%H:%M:%S')} 출석\n\n"
-            "아래 버튼을 눌러 출석해주세요.\n"
-            "출석 시 **1점**이 지급됩니다.\n"
-            f"⏰ 유효시간: {validity_text}",
-            view=AttendanceView()
-        )
-
-        await admin_channel.send(
-            f"🔐 **출석 비밀번호**\n\n"
-            f"```{current_password}```\n\n"
-            f"🕒 출석 시간: {now.strftime('%H:%M:%S')}\n"
-            f"⏰ 유효시간: {validity_text}\n"
-            "⚠️ 이 번호는 혈맹원에게 알려주세요."
-        )
-
-        await send_boss_panel()
-
-        def mark_panel_sent():
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE attendance_sessions
-                        SET panel_sent=TRUE
-                        WHERE date=%s AND time_slot=%s
-                    """, (date_text, slot_text))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                release_db_connection(conn)
-
-        await run_db(mark_panel_sent)
-        last_panel_key = panel_key
-
-        print(
-            f"[자동 출석] {date_text} [세션 {slot_text}] "
-            f"비밀번호={current_password} / 패널 생성 완료"
-        )
-
-    except Exception as e:
-        # 패널 전송 중 하나라도 실패하면 panel_sent를 TRUE로 만들지 않습니다.
-        # 다음 10초 주기에 다시 시도할 수 있습니다.
-        print(f"[자동 출석 패널 오류] {type(e).__name__}: {e}")
-
-
-# =====================================================
-# 🔹 3시간 후 채널 전체 초기화
-# =====================================================
-@tasks.loop(seconds=10)
-async def automatic_channel_cleanup():
-
-    now = datetime.now(KST)
-
-    if TEST_MODE:
-        # 가산점은 호출별 1분 세션이므로 별도 6시간 종료 처리를 하지 않습니다.
-        return
-
-    # 운영 모드:
-    # 채팅방 초기화: 00:00 / 06:00 / 12:00 / 18:00
-    # 일반 혈맹방과 관리자방의 채팅을 함께 초기화합니다.
-    cleanup_hours = {0, 6, 12, 18}
-
-    if now.hour not in cleanup_hours:
-        return
-
-    # 정각의 첫 1분 안에 한 번만 실행합니다.
-    if now.minute > 0:
-        return
-
-    await clear_both_channels()
-
-    print(
-        f"[자동 채널 초기화] "
-        f"{now.strftime('%Y-%m-%d %H:%M')}"
-    )
-
-
-# =====================================================
-# 🔹 봇 설정
-# =====================================================
-google_sheet_worker_task = None
-
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-# 봇 시작 시 출석 버튼을 Persistent View로 등록
-bot.add_view(AttendanceView())
-
-
-# =====================================================
-# 🔹 관리자 전용 명령어
-# =====================================================
 class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 확인"):
     confirm_input = discord.ui.TextInput(
         label="초기화 동의 문구",
