@@ -639,6 +639,10 @@ def init_database():
                     UNIQUE(date, time, record_type, user_id)
                 )
             """)
+            cursor.execute("""
+                ALTER TABLE google_sheet_queue
+                ADD COLUMN IF NOT EXISTS dedupe_key TEXT
+            """)
 
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS google_sheet_queue_pending_idx
@@ -794,23 +798,80 @@ def enqueue_google_sheet_record(
     username,
     points,
     item_name=None,
-    boss_name=None
+    boss_name=None,
+    dedupe_key=None
 ):
-    """현재 DB 트랜잭션 안에서 Google Sheets 동기화 대상을 큐에 넣습니다."""
+    """
+    Google Sheets 전송 대상 1건을 DB 큐에 등록합니다.
+    실제 HTTP 요청은 여기서 하지 않습니다.
+    """
     if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
+        print(
+            "[Google Sheets 큐 등록 실패] "
+            "GOOGLE_SHEETS_URL 또는 GOOGLE_SHEETS_SECRET가 없습니다."
+        )
         return False
 
-    cursor.execute("""
-        INSERT INTO google_sheet_queue
-            (date, time, record_type, user_id, username, points, item_name, boss_name)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (date, time, record_type, user_id) DO NOTHING
-    """, (
-        str(date_text), str(time_text), str(record_type),
-        int(user_id), str(username), int(points),
-        str(item_name or ""), str(boss_name or "")
-    ))
-    return cursor.rowcount > 0
+    try:
+        # 별도의 dedupe_key가 있으면 먼저 같은 키가 있는지 확인합니다.
+        if dedupe_key:
+            cursor.execute("""
+                SELECT 1
+                FROM google_sheet_queue
+                WHERE dedupe_key=%s
+                LIMIT 1
+            """, (str(dedupe_key),))
+
+            if cursor.fetchone() is not None:
+                print(
+                    f"[Google Sheets 큐 중복] "
+                    f"type={record_type} / user={username} / key={dedupe_key}"
+                )
+                return False
+
+        cursor.execute("""
+            INSERT INTO google_sheet_queue
+                (date, time, record_type, user_id, username, points,
+                 item_name, boss_name, dedupe_key)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (date, time, record_type, user_id)
+            DO NOTHING
+            RETURNING id
+        """, (
+            str(date_text),
+            str(time_text),
+            str(record_type),
+            int(user_id),
+            str(username),
+            int(points),
+            str(item_name or ""),
+            str(boss_name or ""),
+            str(dedupe_key or "")
+        ))
+
+        row = cursor.fetchone()
+
+        if row is None:
+            print(
+                f"[Google Sheets 큐 중복/무시] "
+                f"type={record_type} / user={username} / "
+                f"date={date_text} / time={time_text}"
+            )
+            return False
+
+        print(
+            f"[Google Sheets 큐 등록] "
+            f"queue_id={row[0]} / type={record_type} / "
+            f"user={username} / points={points}"
+        )
+        return True
+
+    except Exception as e:
+        print(
+            f"[Google Sheets 큐 등록 오류] "
+            f"{type(e).__name__}: {e}"
+        )
+        raise
 
 
 def save_attendance_atomic(
@@ -1572,6 +1633,10 @@ async def google_sheet_sync_worker():
     while True:
         try:
             if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
+                print(
+                    "[Google Sheets 워커 대기] "
+                    "GOOGLE_SHEETS_URL/GOOGLE_SHEETS_SECRET 환경변수 확인 필요"
+                )
                 await asyncio.sleep(30)
                 continue
 
@@ -1594,6 +1659,12 @@ async def google_sheet_sync_worker():
                 boss_name,
             ) = job
 
+            print(
+                f"[Google Sheets 전송 시작] "
+                f"queue={queue_id} / type={record_type} / "
+                f"user={username}"
+            )
+
             success, retry_after, error_text = await asyncio.to_thread(
                 send_to_google_sheet,
                 date_text,
@@ -1608,6 +1679,11 @@ async def google_sheet_sync_worker():
 
             if success:
                 await run_db(mark_google_sheet_success, queue_id)
+                print(
+                    f"[Google Sheets 전송 성공] "
+                    f"queue={queue_id} / type={record_type} / "
+                    f"user={username}"
+                )
                 await asyncio.sleep(GOOGLE_SHEETS_MIN_INTERVAL)
                 continue
 
@@ -1621,8 +1697,10 @@ async def google_sheet_sync_worker():
                 wait_seconds
             )
             print(
-                f"[Google Sheets 재시도 예약] queue={queue_id} "
-                f"attempt={int(attempts)+1} wait={wait_seconds}s"
+                f"[Google Sheets 전송 실패/재시도] "
+                f"queue={queue_id} / type={record_type} / "
+                f"user={username} / attempt={int(attempts)+1} "
+                f"wait={wait_seconds}s / error={error_text}"
             )
             await asyncio.sleep(min(wait_seconds, 30))
 
@@ -3678,6 +3756,12 @@ async def on_ready():
         render_self_ping_task = asyncio.create_task(
             render_self_ping_worker()
         )
+
+    print(
+        "[Google Sheets 설정] "
+        f"URL={'설정됨' if GOOGLE_SHEETS_URL else '없음'} / "
+        f"SECRET={'설정됨' if GOOGLE_SHEETS_SECRET else '없음'}"
+    )
 
     print(f"로그인 완료: {bot.user}")
     print(
