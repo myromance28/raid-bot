@@ -264,8 +264,16 @@ boss_panel_message_id = None
 gateway_disconnected_at = None
 gateway_last_connected_at = None
 gateway_watchdog_task = None
+render_self_ping_task = None
 GATEWAY_WATCHDOG_INTERVAL = 15
 GATEWAY_MAX_DISCONNECT_SECONDS = 300  # 5분
+
+# =====================================================
+# 🔹 Render Free 슬립 완화용 경량 self-ping
+# =====================================================
+# Render가 제공하는 RENDER_EXTERNAL_URL의 "/"를 10분마다 1회 호출합니다.
+# 별도 외부 서비스/환경변수 설정 없이 현재 Web Service 자체를 가볍게 확인합니다.
+RENDER_SELF_PING_INTERVAL = 600  # 10분
 
 
 def get_current_slot(hour=None):
@@ -3084,6 +3092,41 @@ async def on_error(event, *args, **kwargs):
     traceback.print_exc()
 
 
+async def render_self_ping_worker():
+    """
+    Render Free의 idle sleep을 완화하기 위한 경량 HTTP self-ping입니다.
+    10분마다 자신의 public URL "/"를 한 번 호출합니다.
+    """
+    while True:
+        try:
+            await asyncio.sleep(RENDER_SELF_PING_INTERVAL)
+
+            base_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+            if not base_url:
+                print("[RENDER PING] RENDER_EXTERNAL_URL이 없어 건너뜁니다.")
+                continue
+
+            url = base_url.rstrip("/") + "/"
+
+            def ping():
+                request = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "RAID-Bot-Render-Ping"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status
+
+            status = await asyncio.to_thread(ping)
+            print(f"[RENDER PING] OK status={status}")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[RENDER PING 오류] {type(e).__name__}: {e}")
+            await asyncio.sleep(10)
+
+
 async def discord_gateway_watchdog():
     """
     Discord Gateway 연결 상태를 감시합니다.
@@ -3162,6 +3205,12 @@ async def on_ready():
     if gateway_watchdog_task is None or gateway_watchdog_task.done():
         gateway_watchdog_task = asyncio.create_task(
             discord_gateway_watchdog()
+        )
+
+    global render_self_ping_task
+    if render_self_ping_task is None or render_self_ping_task.done():
+        render_self_ping_task = asyncio.create_task(
+            render_self_ping_worker()
         )
 
     print(f"로그인 완료: {bot.user}")
