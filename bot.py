@@ -1294,17 +1294,19 @@ def save_siege_attendance_atomic(
                 conn.rollback()
                 return "password"
 
+            # 같은 날짜에는 공성전 세션이 여러 개 생성되어도
+            # 사용자당 공성전 출석은 1회만 허용합니다.
             acquire_attendance_lock(
                 cursor,
-                f"siege:{int(db_session_id)}:{int(user_id)}"
+                f"siege:{str(date_text)}:{int(user_id)}"
             )
 
             cursor.execute("""
                 SELECT 1
                 FROM siege_attendance
-                WHERE siege_session_id=%s AND user_id=%s
+                WHERE date=%s AND user_id=%s
                 LIMIT 1
-            """, (int(db_session_id), int(user_id)))
+            """, (str(date_text), int(user_id)))
 
             if cursor.fetchone() is not None:
                 conn.rollback()
@@ -2210,7 +2212,7 @@ class SiegeAttendanceModal(
             if result == "password":
                 message = "❌ 공성전 비밀번호가 틀렸습니다."
             elif result == "duplicate":
-                message = "⚠️ 이미 이번 공성전 출석을 완료하셨습니다."
+                message = "⚠️ 오늘 공성전 출석을 이미 완료하셨습니다."
             elif result == "date":
                 message = "❌ 오늘 생성된 공성전 출석이 아닙니다."
             else:
@@ -2235,7 +2237,7 @@ class SiegeAttendanceModal(
 class SiegeAttendanceButton(discord.ui.Button):
     def __init__(self, session_id):
         super().__init__(
-            label="공성전",
+            label="🟨 공성전",
             style=discord.ButtonStyle.secondary,
             custom_id=f"raid_siege_attendance_{int(session_id)}"
         )
