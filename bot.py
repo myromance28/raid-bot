@@ -26,10 +26,10 @@ from threading import Thread
 KST = timezone(timedelta(hours=9))
 
 # 일반 출석창
-ATTENDANCE_CHANNEL_ID = 1538446431772217405
+ATTENDANCE_CHANNEL_ID = 1539869502072815646
 
 # 관리자 전용 비밀번호 방
-ADMIN_CHANNEL_ID = 1538446527968706691
+ADMIN_CHANNEL_ID = 1539869550084886609
 
 # 출석 패널 / 비밀번호 생성 시간
 # 테스트 모드: 2분마다 새로운 출석 세션 생성
