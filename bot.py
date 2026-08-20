@@ -31,6 +31,9 @@ ATTENDANCE_CHANNEL_ID = 1539869502072815646
 # 관리자 전용 비밀번호 방
 ADMIN_CHANNEL_ID = 1539869550084886609
 
+# DB 초기화 전용 사용자 ID
+DB_RESET_OWNER_ID = 344403970426535937
+
 # 출석 패널 / 비밀번호 생성 시간
 # 테스트 모드: 2분마다 새로운 출석 세션 생성
 # 실제 운영 전환 시 TEST_MODE = False
@@ -1294,19 +1297,17 @@ def save_siege_attendance_atomic(
                 conn.rollback()
                 return "password"
 
-            # 같은 날짜에는 공성전 세션이 여러 개 생성되어도
-            # 사용자당 공성전 출석은 1회만 허용합니다.
             acquire_attendance_lock(
                 cursor,
-                f"siege:{str(date_text)}:{int(user_id)}"
+                f"siege:{int(db_session_id)}:{int(user_id)}"
             )
 
             cursor.execute("""
                 SELECT 1
                 FROM siege_attendance
-                WHERE date=%s AND user_id=%s
+                WHERE siege_session_id=%s AND user_id=%s
                 LIMIT 1
-            """, (str(date_text), int(user_id)))
+            """, (int(db_session_id), int(user_id)))
 
             if cursor.fetchone() is not None:
                 conn.rollback()
@@ -2212,7 +2213,7 @@ class SiegeAttendanceModal(
             if result == "password":
                 message = "❌ 공성전 비밀번호가 틀렸습니다."
             elif result == "duplicate":
-                message = "⚠️ 오늘 공성전 출석을 이미 완료하셨습니다."
+                message = "⚠️ 이미 이번 공성전 출석을 완료하셨습니다."
             elif result == "date":
                 message = "❌ 오늘 생성된 공성전 출석이 아닙니다."
             else:
@@ -2647,6 +2648,13 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
         if interaction.channel_id != ADMIN_CHANNEL_ID:
             return await interaction.response.send_message(
                 "❌ 관리자 전용방에서만 초기화할 수 있습니다.",
+                ephemeral=True
+            )
+
+        # 확인창 제출 단계에서도 최종적으로 사용자 ID를 다시 확인합니다.
+        if interaction.user.id != DB_RESET_OWNER_ID:
+            return await interaction.response.send_message(
+                "❌ DB 초기화 권한이 없습니다.",
                 ephemeral=True
             )
 
@@ -3539,6 +3547,12 @@ async def db_reset(ctx):
     if not is_admin_channel(ctx):
         return await ctx.send(
             "❌ 이 명령어는 관리자 전용방에서만 사용할 수 있습니다."
+        )
+
+    # DB 초기화는 지정된 Discord 사용자 본인만 사용할 수 있습니다.
+    if ctx.author.id != DB_RESET_OWNER_ID:
+        return await ctx.send(
+            "❌ DB 초기화 권한이 없습니다."
         )
 
     await ctx.send(
