@@ -3215,7 +3215,9 @@ def make_period_page(rows, start_date, end_date, page, page_size=50):
 class PeriodScoreView(discord.ui.View):
     def __init__(self, ctx, rows, start_date, end_date, page=0):
         super().__init__(timeout=300)
-        self.ctx_id = ctx.author.id
+        # 기간조회에서는 Discord Interaction을 전달하므로 user를 사용하고,
+        # 기존 호출 방식(Context)이 들어와도 기존 기능이 유지되도록 처리합니다.
+        self.ctx_id = getattr(ctx, "user", None).id if hasattr(ctx, "user") else ctx.author.id
         self.rows = rows
         self.start_date = start_date
         self.end_date = end_date
