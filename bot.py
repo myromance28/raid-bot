@@ -2693,7 +2693,7 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
                         )
 
                         cursor.execute(
-                            "TRUNCATE TABLE boss_drops, boss_list "
+                            "TRUNCATE TABLE boss_drops "
                             "RESTART IDENTITY CASCADE"
                         )
 
@@ -2732,7 +2732,7 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
             bonus_slot = None
             bonus_points = None
             bonus_created_at = None
-            boss_names.clear()
+            # 보스 목록은 DB 초기화 대상에서 제외하므로 메모리 목록도 유지합니다.
             boss_panel_message_id = None
 
             # DB 초기화 시 일반 출석창의 가산점 패널도 제거
@@ -2751,7 +2751,9 @@ class DBResetConfirmModal(discord.ui.Modal, title="⚠️ DB 전체 초기화 �
                 "🧹 **DB 전체 초기화 완료**\n\n"
                 "• 모든 출석 기록 삭제\n"
                 "• 출석 비밀번호 세션 초기화\n"
-                "• 현재 출석 세션 초기화 완료\n\n"
+                "• 현재 출석 세션 초기화 완료\n"
+                "• 보스 목록 유지\n"
+                "• 득템 기록 초기화\n\n"
                 "이제 Discord ID 기준으로 출석 기록을 새로 저장합니다.",
                 ephemeral=True
             )
@@ -3562,7 +3564,10 @@ async def db_reset(ctx):
         "삭제되는 정보:\n"
         "• 모든 출석 기록\n"
         "• 출석 비밀번호 세션\n"
-        "• 가산점 기록 및 세션\n\n"
+        "• 가산점 기록 및 세션\n"
+        "• 득템 기록\n"
+        "• Google Sheets 전송 대기 기록\n\n"
+        "✅ 보스 목록은 삭제되지 않습니다.\n\n"
         "⚠️ **초기화 후에는 데이터를 복구할 수 없습니다.**\n\n"
         "아래 **확인 버튼**을 눌러 초기화 확인창을 열어주세요.",
         view=DBResetConfirmView()
