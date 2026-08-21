@@ -83,7 +83,8 @@ def send_to_google_sheet(
     username,
     points,
     item_name=None,
-    boss_name=None
+    boss_name=None,
+    dedupe_key=None
 ):
     """
     Google Sheets로 1건을 전송합니다.
@@ -107,6 +108,7 @@ def send_to_google_sheet(
         "points": int(points),
         "item_name": str(item_name or ""),
         "boss_name": str(boss_name or ""),
+        "dedupe_key": str(dedupe_key or ""),
     }
 
     try:
@@ -653,6 +655,23 @@ def init_database():
                 ADD COLUMN IF NOT EXISTS dedupe_key TEXT
             """)
 
+            # 기존 중복 dedupe_key가 있다면 오래된 1건만 남깁니다.
+            cursor.execute("""
+                DELETE FROM google_sheet_queue a
+                USING google_sheet_queue b
+                WHERE a.dedupe_key IS NOT NULL
+                  AND a.dedupe_key <> ''
+                  AND a.dedupe_key = b.dedupe_key
+                  AND a.id > b.id
+            """)
+
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                google_sheet_queue_dedupe_key_unique_idx
+                ON google_sheet_queue(dedupe_key)
+                WHERE dedupe_key IS NOT NULL AND dedupe_key <> ''
+            """)
+
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS google_sheet_queue_pending_idx
                 ON google_sheet_queue(sent_at, next_attempt_at, id)
@@ -951,7 +970,8 @@ def save_attendance_atomic(
                 "출석",
                 user_id,
                 username,
-                1
+                1,
+                dedupe_key=f"attendance:{date_text}:{slot_text}:{int(user_id)}"
             )
 
         conn.commit()
@@ -1311,9 +1331,9 @@ def save_siege_attendance_atomic(
             cursor.execute("""
                 SELECT 1
                 FROM siege_attendance
-                WHERE siege_session_id=%s AND user_id=%s
+                WHERE date=%s AND user_id=%s
                 LIMIT 1
-            """, (int(db_session_id), int(user_id)))
+            """, (str(date_text), int(user_id)))
 
             if cursor.fetchone() is not None:
                 conn.rollback()
@@ -1338,7 +1358,8 @@ def save_siege_attendance_atomic(
                 "공성출석",
                 user_id,
                 username,
-                0
+                0,
+                dedupe_key=f"siege:{date_text}:{int(user_id)}"
             )
 
         conn.commit()
@@ -1482,7 +1503,8 @@ def save_bonus_attendance_atomic(
                 "가산점",
                 int(user_id),
                 str(username),
-                int(points)
+                int(points),
+                dedupe_key=f"bonus:{int(db_session_id)}:{int(user_id)}"
             )
 
         conn.commit()
@@ -1548,7 +1570,8 @@ def save_bonus_attendance(
                     "가산점",
                     int(user_id),
                     str(username),
-                    int(points)
+                    int(points),
+                    dedupe_key=f"bonus:{int(session_id)}:{int(user_id)}"
                 )
 
         conn.commit()
@@ -1582,7 +1605,7 @@ def get_next_google_sheet_job():
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT id, date, time, record_type, user_id, username,
-                       points, attempts, item_name, boss_name
+                       points, attempts, item_name, boss_name, dedupe_key
                 FROM google_sheet_queue
                 WHERE sent_at IS NULL
                   AND next_attempt_at <= CURRENT_TIMESTAMP
@@ -1768,6 +1791,7 @@ async def google_sheet_sync_worker():
                 attempts,
                 item_name,
                 boss_name,
+                dedupe_key,
             ) = job
 
             print(
@@ -1785,7 +1809,8 @@ async def google_sheet_sync_worker():
                 username,
                 points,
                 item_name,
-                boss_name
+                boss_name,
+                dedupe_key
             )
 
             if success:
