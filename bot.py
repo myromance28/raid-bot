@@ -647,12 +647,70 @@ def init_database():
                     next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_error TEXT,
                     sent_at TIMESTAMP NULL,
-                    UNIQUE(date, time, record_type, user_id)
                 )
             """)
             cursor.execute("""
                 ALTER TABLE google_sheet_queue
                 ADD COLUMN IF NOT EXISTS dedupe_key TEXT
+            """)
+
+            # 기존 (date,time,record_type,user_id) UNIQUE 제약 제거.
+            # 같은 초에 발생한 정상적인 별도 기록까지 막지 않도록 합니다.
+            cursor.execute("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT c.conname
+                        FROM pg_constraint c
+                        JOIN pg_class t ON t.oid = c.conrelid
+                        WHERE t.relname = 'google_sheet_queue'
+                          AND c.contype = 'u'
+                          AND pg_get_constraintdef(c.oid)
+                              ILIKE '%(date, time, record_type, user_id)%'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE google_sheet_queue DROP CONSTRAINT IF EXISTS %I',
+                            r.conname
+                        );
+                    END LOOP;
+                END $$;
+            """)
+
+            cursor.execute("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT indexname
+                        FROM pg_indexes
+                        WHERE tablename = 'google_sheet_queue'
+                          AND indexdef ILIKE 'CREATE UNIQUE INDEX%'
+                          AND indexdef ILIKE '%(date, time, record_type, user_id)%'
+                    LOOP
+                        EXECUTE format(
+                            'DROP INDEX IF EXISTS %I',
+                            r.indexname
+                        );
+                    END LOOP;
+                END $$;
+            """)
+
+            # 이미 같은 dedupe_key가 여러 개라면 가장 오래된 1개만 남깁니다.
+            cursor.execute("""
+                DELETE FROM google_sheet_queue a
+                USING google_sheet_queue b
+                WHERE a.dedupe_key IS NOT NULL
+                  AND a.dedupe_key <> ''
+                  AND a.dedupe_key = b.dedupe_key
+                  AND a.id > b.id
+            """)
+
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                google_sheet_queue_dedupe_key_unique_idx
+                ON google_sheet_queue(dedupe_key)
+                WHERE dedupe_key IS NOT NULL AND dedupe_key <> ''
             """)
 
             # 기존 중복 dedupe_key가 있다면 오래된 1건만 남깁니다.
@@ -862,8 +920,7 @@ def enqueue_google_sheet_record(
                 (date, time, record_type, user_id, username, points,
                  item_name, boss_name, dedupe_key)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (date, time, record_type, user_id)
-            DO NOTHING
+            ON CONFLICT DO NOTHING
             RETURNING id
         """, (
             str(date_text),
