@@ -646,7 +646,7 @@ def init_database():
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_error TEXT,
-                    sent_at TIMESTAMP NULL,
+                    sent_at TIMESTAMP NULL
                 )
             """)
             cursor.execute("""
