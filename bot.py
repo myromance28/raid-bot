@@ -3312,7 +3312,7 @@ def load_period_scores(start_date, end_date):
         release_db_connection(conn)
 
 
-def make_period_page(rows, start_date, end_date, page, page_size=50):
+def make_period_page(rows, start_date, end_date, page, page_size=25):
     import unicodedata
     total_pages = max(1, (len(rows) + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
@@ -3367,7 +3367,7 @@ class PeriodScoreView(discord.ui.View):
         self.start_date = start_date
         self.end_date = end_date
         self.page = page
-        self.page_size = 50
+        self.page_size = 25
         self.refresh_buttons()
 
     def refresh_buttons(self):
@@ -3459,7 +3459,7 @@ class PeriodQueryModal(discord.ui.Modal, title="📅 기간 조회"):
                 )
 
             content, _, page = make_period_page(
-                rows, start.isoformat(), end.isoformat(), 0, 50
+                rows, start.isoformat(), end.isoformat(), 0, 25
             )
             await interaction.response.send_message(
                 content,
@@ -3470,8 +3470,16 @@ class PeriodQueryModal(discord.ui.Modal, title="📅 기간 조회"):
             )
         except Exception as e:
             print(f"[기간조회 오류] {type(e).__name__}: {e}")
+
+            # Discord ephemeral 응답도 2000자 제한이 있으므로
+            # 예외 문자열이 길어져도 절대 2000자를 넘지 않게 합니다.
+            error_text = str(e)
+            if len(error_text) > 1500:
+                error_text = error_text[:1500] + "...(오류 내용 생략)"
+
             await interaction.response.send_message(
-                f"❌ 기간 조회 중 DB 오류가 발생했습니다.\n```{e}```",
+                "❌ 기간 조회 중 DB 오류가 발생했습니다.\n"
+                f"```{error_text}```",
                 ephemeral=True
             )
 
