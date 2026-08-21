@@ -273,6 +273,7 @@ gateway_disconnected_at = None
 gateway_last_connected_at = None
 gateway_watchdog_task = None
 render_self_ping_task = None
+google_sheet_worker_task = None
 GATEWAY_WATCHDOG_INTERVAL = 15
 GATEWAY_MAX_DISCONNECT_SECONDS = 300  # 5분
 
