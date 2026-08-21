@@ -274,6 +274,7 @@ gateway_last_connected_at = None
 gateway_watchdog_task = None
 render_self_ping_task = None
 google_sheet_worker_task = None
+google_sheet_health_task = None
 GATEWAY_WATCHDOG_INTERVAL = 15
 GATEWAY_MAX_DISCONNECT_SECONDS = 300  # 5분
 
@@ -1627,6 +1628,108 @@ def mark_google_sheet_failure(queue_id, error_text, retry_seconds):
         raise
     finally:
         release_db_connection(conn)
+
+
+
+async def google_sheet_health_check():
+    """
+    Google Apps Script 웹앱 연결 상태를 60초마다 확인합니다.
+
+    Apps Script에 doGet()이 있으므로 GET 요청만 보내서
+    실제 웹앱 endpoint가 살아있는지 확인합니다.
+    시트에 데이터를 추가하지 않습니다.
+
+    상태가 바뀔 때:
+      🟢 연결됨
+      🔴 연결 끊김
+    을 로그에 출력합니다.
+    """
+    last_state = None
+
+    while True:
+        try:
+            if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
+                state = False
+
+                if last_state is not False:
+                    print(
+                        "[Google Sheets 상태] 🔴 연결 끊김 "
+                        "(URL/SECRET 환경변수 없음)"
+                    )
+
+                last_state = state
+                await asyncio.sleep(60)
+                continue
+
+            try:
+                # Apps Script doGet() 확인.
+                # urllib은 HTTP redirect도 기본적으로 따라갑니다.
+                request = urllib.request.Request(
+                    GOOGLE_SHEETS_URL,
+                    headers={
+                        "User-Agent": "RAID-BOT-GoogleSheets-HealthCheck/1.0"
+                    },
+                    method="GET",
+                )
+
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    status_code = getattr(response, "status", 200)
+                    response.read(256)
+
+                state = 200 <= int(status_code) < 400
+
+                if state:
+                    if last_state is not True:
+                        print(
+                            f"[Google Sheets 상태] 🟢 연결됨 "
+                            f"(HTTP {status_code})"
+                        )
+                    else:
+                        print(
+                            f"[Google Sheets 상태] 🟢 정상 "
+                            f"(HTTP {status_code})"
+                        )
+                else:
+                    print(
+                        f"[Google Sheets 상태] 🔴 연결 끊김 "
+                        f"(HTTP {status_code})"
+                    )
+
+                last_state = state
+
+            except urllib.error.HTTPError as e:
+                # 429/1015도 연결 이상으로 표시.
+                print(
+                    f"[Google Sheets 상태] 🔴 연결 끊김 "
+                    f"(HTTP {e.code})"
+                )
+                last_state = False
+
+            except urllib.error.URLError as e:
+                print(
+                    f"[Google Sheets 상태] 🔴 연결 끊김 "
+                    f"(네트워크 오류: {e})"
+                )
+                last_state = False
+
+            except Exception as e:
+                print(
+                    f"[Google Sheets 상태] 🔴 연결 끊김 "
+                    f"({type(e).__name__}: {e})"
+                )
+                last_state = False
+
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            print(
+                f"[Google Sheets 상태 감시 오류] "
+                f"{type(e).__name__}: {e}"
+            )
+            await asyncio.sleep(60)
 
 
 async def google_sheet_sync_worker():
@@ -3007,7 +3110,7 @@ def load_weekly_scores(start_date, end_date):
         release_db_connection(conn)
 
 
-def make_weekly_page(rows, period_name, start_date, end_date, page, page_size=50):
+def make_weekly_page(rows, period_name, start_date, end_date, page, page_size=25):
     total_pages=max(1,(len(rows)+page_size-1)//page_size)
     page=max(0,min(page,total_pages-1))
     offset=page*page_size
@@ -3062,7 +3165,7 @@ class WeeklyScoreView(discord.ui.View):
         self.start_date=start_date
         self.end_date=end_date
         self.page=page
-        self.page_size=50
+        self.page_size=25
         self.refresh_buttons()
 
     def refresh_buttons(self):
@@ -3106,30 +3209,67 @@ async def weekly_score_command(ctx,weeks=1):
     if not is_admin_channel(ctx):
         return await ctx.send("❌ 관리자 전용방에서만 사용할 수 있습니다.")
 
-    now=datetime.now(KST)
-    today=now.date()
-    current_monday=today-timedelta(days=today.weekday())
-    start_date=current_monday-timedelta(days=(weeks-1)*7)
+    try:
+        now = datetime.now(KST)
+        today = now.date()
+        current_monday = today - timedelta(days=today.weekday())
+        start_date = current_monday - timedelta(days=(weeks - 1) * 7)
 
-    rows=await run_db(
-        load_weekly_scores,
-        start_date.isoformat(),
-        today.isoformat()
-    )
-
-    period_name={1:"이번 주",2:"최근 2주",3:"최근 3주",4:"최근 4주"}[weeks]
-    content,_,page=make_weekly_page(
-        rows,period_name,start_date.isoformat(),
-        today.isoformat(),0,50
-    )
-
-    await ctx.send(
-        content,
-        view=WeeklyScoreView(
-            ctx,rows,period_name,
-            start_date.isoformat(),today.isoformat(),page
+        rows = await run_db(
+            load_weekly_scores,
+            start_date.isoformat(),
+            today.isoformat()
         )
-    )
+
+        period_name = {
+            1: "이번 주",
+            2: "최근 2주",
+            3: "최근 3주",
+            4: "최근 4주"
+        }[weeks]
+
+        # Discord 메시지 2000자 제한을 피하기 위해
+        # 한 페이지 최대 25명으로 표시합니다.
+        content, _, page = make_weekly_page(
+            rows,
+            period_name,
+            start_date.isoformat(),
+            today.isoformat(),
+            0,
+            25
+        )
+
+        await ctx.send(
+            content,
+            view=WeeklyScoreView(
+                ctx,
+                rows,
+                period_name,
+                start_date.isoformat(),
+                today.isoformat(),
+                page
+            )
+        )
+
+        print(
+            f"[주간 조회 성공] {period_name} / "
+            f"기간={start_date.isoformat()}~{today.isoformat()} / "
+            f"인원={len(rows)}"
+        )
+
+    except Exception as e:
+        print(
+            f"[주간 조회 오류] "
+            f"{type(e).__name__}: {e}"
+        )
+
+        try:
+            await ctx.send(
+                "❌ **주간 점수 조회 중 오류가 발생했습니다.**\n"
+                f"```{type(e).__name__}: {e}```"
+            )
+        except Exception:
+            pass
 
 
 
@@ -4056,6 +4196,12 @@ async def on_ready():
     global google_sheet_worker_task
     if google_sheet_worker_task is None or google_sheet_worker_task.done():
         google_sheet_worker_task = asyncio.create_task(google_sheet_sync_worker())
+
+    global google_sheet_health_task
+    if google_sheet_health_task is None or google_sheet_health_task.done():
+        google_sheet_health_task = asyncio.create_task(
+            google_sheet_health_check()
+        )
 
     global gateway_watchdog_task
     if gateway_watchdog_task is None or gateway_watchdog_task.done():
