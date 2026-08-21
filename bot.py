@@ -1921,12 +1921,17 @@ def save_boss_drop_db(boss_name, drop_name, user_id, username):
             cursor.execute(
                 "INSERT INTO boss_drops "
                 "(boss_name, drop_name, user_id, username) "
-                "VALUES (%s,%s,%s,%s)",
+                "VALUES (%s,%s,%s,%s) "
+                "RETURNING id",
                 (boss_name, drop_name, user_id, username)
             )
 
-            # 득템도 기존 출석과 동일하게 DB 큐를 거쳐 Google Sheets로 전송합니다.
-            # 마이크로초까지 포함해 같은 초에 여러 득템을 등록해도 구분됩니다.
+            drop_row = cursor.fetchone()
+            drop_id = int(drop_row[0])
+
+            # 득템은 실제 DB 기록 ID를 고유키로 사용합니다.
+            # Google Sheets 전송이 재시도되어도 같은 득템 기록은
+            # 절대로 두 번째 행으로 추가되지 않습니다.
             now = datetime.now(KST)
             enqueue_google_sheet_record(
                 cursor,
@@ -1937,7 +1942,8 @@ def save_boss_drop_db(boss_name, drop_name, user_id, username):
                 username,
                 0,
                 item_name=drop_name,
-                boss_name=boss_name
+                boss_name=boss_name,
+                dedupe_key=f"drop:{drop_id}"
             )
 
         conn.commit()
