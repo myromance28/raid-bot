@@ -91,7 +91,11 @@ def send_to_google_sheet(
     반환값: (성공여부, retry_after_seconds, error_text)
     """
     if not GOOGLE_SHEETS_URL or not GOOGLE_SHEETS_SECRET:
-        return True, None, ""
+        error_text = (
+            "GOOGLE_SHEETS_URL 또는 GOOGLE_SHEETS_SECRET가 없습니다."
+        )
+        print(f"[Google Sheets] {error_text}")
+        return False, 60, error_text
 
     payload = {
         "secret": GOOGLE_SHEETS_SECRET,
@@ -2470,7 +2474,7 @@ class BonusPointButton(discord.ui.Button):
 
             if not created_new:
                 return await interaction.followup.send(
-                    "🔵 **현재 가산점이 이미 활성화되어 있습니다.**\n\n"
+                    "🔴 **현재 가산점이 이미 활성화되어 있습니다.**\n\n"
                     f"⭐ 가산점: **+{int(session_points)}점**\n"
                     f"🔐 가산점 비밀번호\n"
                     f"```{session_password}```\n\n"
@@ -3902,9 +3906,8 @@ async def automatic_channel_cleanup():
     if TEST_MODE:
         return
 
-    # 출석 패널(03/09/15/21시)이 생성된 뒤 3시간 후:
-    # 06:00 / 12:00 / 18:00 / 00:00에
-    # 출석체크방 + 관리자방의 모든 일반 메시지를 순차 삭제합니다.
+    # 출석 패널 생성 3시간 후인 00/06/12/18시에
+    # 출석체크방 + 관리자방의 일반 채널 메시지를 전부 삭제
     cleanup_hours = {0, 6, 12, 18}
 
     if now.hour not in cleanup_hours or now.minute != 0:
@@ -3920,16 +3923,20 @@ async def automatic_channel_cleanup():
 
         if channel is None:
             print(
-                f"[자동 채널 초기화] {channel_name}을 찾을 수 없습니다: {channel_id}"
+                f"[자동 채널 초기화] {channel_name}을 찾을 수 없습니다: "
+                f"{channel_id}"
             )
             continue
 
         deleted_count = 0
 
         try:
-            # 채널의 일반 메시지를 모두 가져옵니다.
             messages = []
-            async for message in channel.history(limit=None, oldest_first=True):
+
+            async for message in channel.history(
+                limit=None,
+                oldest_first=True
+            ):
                 messages.append(message)
 
             print(
@@ -3948,12 +3955,12 @@ async def automatic_channel_cleanup():
                             f"{deleted_count}/{len(messages)} 삭제"
                         )
 
-                        # 요청 사이 2초 대기
+                        # 메시지 1개당 2초 간격
                         await asyncio.sleep(2)
                         break
 
                     except discord.NotFound:
-                        # 이미 삭제된 메시지는 넘어갑니다.
+                        # 이미 삭제된 메시지는 무시
                         break
 
                     except discord.Forbidden:
@@ -3970,7 +3977,10 @@ async def automatic_channel_cleanup():
                             if retry_after is None:
                                 retry_after = 5
 
-                            retry_after = max(float(retry_after), 2.0)
+                            retry_after = max(
+                                float(retry_after),
+                                2.0
+                            )
 
                             print(
                                 f"[자동 채널 초기화] {channel_name}: "
@@ -3990,7 +4000,8 @@ async def automatic_channel_cleanup():
                     except Exception as e:
                         print(
                             f"[자동 채널 초기화 오류] "
-                            f"{channel_name}: {type(e).__name__}: {e}"
+                            f"{channel_name}: "
+                            f"{type(e).__name__}: {e}"
                         )
                         await asyncio.sleep(2)
                         break
