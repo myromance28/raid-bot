@@ -2539,7 +2539,7 @@ class BonusPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
 
-        for points in range(1, 11):
+        for points in range(1, 6):
             self.add_item(BonusPointButton(points))
 
 
@@ -2797,7 +2797,7 @@ async def bonus_command(ctx):
     await ctx.send(
         "🔵 **가산점 패널**\n\n"
         "부여할 가산점을 선택하세요.\n"
-        "아래 1~10점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
+        "아래 1~5점 중 하나를 눌러야 가산점이 생성됩니다.\n\n"
         "⚠️ 가산점은 이 명령어를 실행하기 전에는 "
         "일반 출석창에 나타나지 않습니다.",
         view=BonusPanelView()
@@ -3897,36 +3897,125 @@ async def automatic_attendance_panel():
 # =====================================================
 @tasks.loop(seconds=10)
 async def automatic_channel_cleanup():
-
     now = datetime.now(KST)
 
     if TEST_MODE:
-        # 가산점은 호출별 1분 세션이므로 별도 6시간 종료 처리를 하지 않습니다.
         return
 
-    # 운영 모드:
-    # 채팅방 초기화: 00:00 / 06:00 / 12:00 / 18:00
-    # 일반 혈맹방과 관리자방의 채팅을 함께 초기화합니다.
+    # 출석 패널(03/09/15/21시)이 생성된 뒤 3시간 후:
+    # 06:00 / 12:00 / 18:00 / 00:00에
+    # 출석체크방 + 관리자방의 모든 일반 메시지를 순차 삭제합니다.
     cleanup_hours = {0, 6, 12, 18}
 
-    if now.hour not in cleanup_hours:
+    if now.hour not in cleanup_hours or now.minute != 0:
         return
 
-    # 정각의 첫 1분 안에 한 번만 실행합니다.
-    if now.minute > 0:
-        return
+    channel_ids = [
+        ("출석체크방", ATTENDANCE_CHANNEL_ID),
+        ("관리자방", ADMIN_CHANNEL_ID),
+    ]
 
-    await clear_both_channels()
+    for channel_name, channel_id in channel_ids:
+        channel = bot.get_channel(channel_id)
 
-    print(
-        f"[자동 채널 초기화] "
-        f"{now.strftime('%Y-%m-%d %H:%M')}"
-    )
+        if channel is None:
+            print(
+                f"[자동 채널 초기화] {channel_name}을 찾을 수 없습니다: {channel_id}"
+            )
+            continue
 
+        deleted_count = 0
 
+        try:
+            # 채널의 일반 메시지를 모두 가져옵니다.
+            messages = []
+            async for message in channel.history(limit=None, oldest_first=True):
+                messages.append(message)
 
-# Google Sheets 워커 상태
-google_sheet_worker_task = None
+            print(
+                f"[자동 채널 초기화 시작] {channel_name} / "
+                f"삭제 대상={len(messages)}개"
+            )
+
+            for message in messages:
+                while True:
+                    try:
+                        await message.delete()
+                        deleted_count += 1
+
+                        print(
+                            f"[자동 채널 초기화] {channel_name}: "
+                            f"{deleted_count}/{len(messages)} 삭제"
+                        )
+
+                        # 요청 사이 2초 대기
+                        await asyncio.sleep(2)
+                        break
+
+                    except discord.NotFound:
+                        # 이미 삭제된 메시지는 넘어갑니다.
+                        break
+
+                    except discord.Forbidden:
+                        print(
+                            f"[자동 채널 초기화 실패] {channel_name}: "
+                            "메시지 삭제 권한이 없습니다."
+                        )
+                        break
+
+                    except discord.HTTPException as e:
+                        if getattr(e, "status", None) == 429:
+                            retry_after = getattr(e, "retry_after", None)
+
+                            if retry_after is None:
+                                retry_after = 5
+
+                            retry_after = max(float(retry_after), 2.0)
+
+                            print(
+                                f"[자동 채널 초기화] {channel_name}: "
+                                f"429 → {retry_after:.2f}초 대기 후 재시도"
+                            )
+
+                            await asyncio.sleep(retry_after)
+                            continue
+
+                        print(
+                            f"[자동 채널 초기화 HTTP 오류] "
+                            f"{channel_name}: {e}"
+                        )
+                        await asyncio.sleep(5)
+                        break
+
+                    except Exception as e:
+                        print(
+                            f"[자동 채널 초기화 오류] "
+                            f"{channel_name}: {type(e).__name__}: {e}"
+                        )
+                        await asyncio.sleep(2)
+                        break
+
+        except discord.Forbidden:
+            print(
+                f"[자동 채널 초기화 실패] {channel_name}: "
+                "메시지 읽기/관리 권한이 없습니다."
+            )
+
+        except discord.HTTPException as e:
+            print(
+                f"[자동 채널 초기화 HTTP 오류] {channel_name}: {e}"
+            )
+
+        except Exception as e:
+            print(
+                f"[자동 채널 초기화 전체 오류] "
+                f"{channel_name}: {type(e).__name__}: {e}"
+            )
+
+        print(
+            f"[자동 채널 초기화 완료] {channel_name}: "
+            f"{deleted_count}개 삭제"
+        )
 
 @bot.event
 async def on_ready():
