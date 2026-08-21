@@ -2434,8 +2434,8 @@ class SiegeAttendanceModal(
 class SiegeAttendanceButton(discord.ui.Button):
     def __init__(self, session_id):
         super().__init__(
-            label="🟨 공성전",
-            style=discord.ButtonStyle.secondary,
+            label="🔴 공성전",
+            style=discord.ButtonStyle.danger,
             custom_id=f"raid_siege_attendance_{int(session_id)}"
         )
         self.session_id = int(session_id)
@@ -3032,7 +3032,7 @@ async def siege_command(ctx):
 
         attendance_message = await attendance_channel.send(
             "🏰 **공성전 출석**\n"
-            "공성전에 참여하신 분은 아래 **노란색 버튼**을 눌러 출석해주세요.\n"
+            "공성전에 참여하신 분은 아래 **빨간색 버튼**을 눌러 출석해주세요.\n"
             "⏰ **호출 후 1시간 동안 유효합니다.**",
             view=SiegeAttendanceView(session_id)
         )
@@ -3159,7 +3159,7 @@ async def drop_list_command(ctx):
 
 
 
-def load_weekly_scores(start_date, end_date):
+def load_weekly_scores(start_datetime, end_datetime):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -3175,7 +3175,8 @@ def load_weekly_scores(start_date, end_date):
                            COALESCE(SUM(points), 0) AS attendance_points,
                            0::BIGINT AS bonus_points
                     FROM attendance_v2
-                    WHERE date >= %s AND date <= %s
+                    WHERE ((date || ' ' || LPAD(time_slot, 2, '0') || ':00:00')::timestamp AT TIME ZONE 'Asia/Seoul') >= %s::timestamptz
+                      AND ((date || ' ' || LPAD(time_slot, 2, '0') || ':00:00')::timestamp AT TIME ZONE 'Asia/Seoul') <= %s::timestamptz
                     GROUP BY user_id, username
 
                     UNION ALL
@@ -3184,7 +3185,8 @@ def load_weekly_scores(start_date, end_date):
                            0::BIGINT AS attendance_points,
                            COALESCE(SUM(points), 0) AS bonus_points
                     FROM bonus_attendance
-                    WHERE date >= %s AND date <= %s
+                    WHERE ((date || ' ' || LPAD(time_slot, 2, '0') || ':00:00')::timestamp AT TIME ZONE 'Asia/Seoul') >= %s::timestamptz
+                      AND ((date || ' ' || LPAD(time_slot, 2, '0') || ':00:00')::timestamp AT TIME ZONE 'Asia/Seoul') <= %s::timestamptz
                     GROUP BY user_id, username
                 ) AS score_data
                 GROUP BY user_id
@@ -3192,7 +3194,7 @@ def load_weekly_scores(start_date, end_date):
                          attendance_points DESC,
                          bonus_points DESC,
                          user_id ASC
-            """, (start_date, end_date, start_date, end_date))
+            """, (start_datetime, end_datetime, start_datetime, end_datetime))
             return cursor.fetchall()
     finally:
         release_db_connection(conn)
@@ -3207,7 +3209,7 @@ def make_weekly_page(rows, period_name, start_date, end_date, page, page_size=25
     lines=[
         f"📊 **{period_name} 주간 점수**",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📅 `{start_date} 00:00 ~ {end_date} 현재`",
+        f"📅 `{start_date} ~ {end_date}`",
         f"📄 **{page+1} / {total_pages} 페이지**  •  총 {len(rows)}명",
         "",
         "```text",
@@ -3299,14 +3301,33 @@ async def weekly_score_command(ctx,weeks=1):
 
     try:
         now = datetime.now(KST)
-        today = now.date()
-        current_monday = today - timedelta(days=today.weekday())
-        start_date = current_monday - timedelta(days=(weeks - 1) * 7)
+
+        # 주간 기준점은 월요일 00:00이 아니라 일요일 21:00입니다.
+        # 예: 2026-08-21(금) 기준
+        # !주간  -> 2026-08-16 21:00 ~ 현재
+        # !2주간 -> 2026-08-09 21:00 ~ 현재
+        days_since_sunday = (now.weekday() + 1) % 7
+        latest_sunday = now.date() - timedelta(days=days_since_sunday)
+        current_period_start = datetime(
+            latest_sunday.year,
+            latest_sunday.month,
+            latest_sunday.day,
+            21, 0, 0,
+            tzinfo=KST
+        )
+
+        # 일요일 21:00 이전이면 아직 이번 주기가 시작되지 않았으므로
+        # 전주 일요일 21:00을 현재 주기의 시작점으로 사용합니다.
+        if now < current_period_start:
+            current_period_start -= timedelta(days=7)
+
+        start_datetime = current_period_start - timedelta(days=(weeks - 1) * 7)
+        end_datetime = now
 
         rows = await run_db(
             load_weekly_scores,
-            start_date.isoformat(),
-            today.isoformat()
+            start_datetime.isoformat(),
+            end_datetime.isoformat()
         )
 
         period_name = {
@@ -3321,8 +3342,8 @@ async def weekly_score_command(ctx,weeks=1):
         content, _, page = make_weekly_page(
             rows,
             period_name,
-            start_date.isoformat(),
-            today.isoformat(),
+            start_datetime.strftime("%Y-%m-%d %H:%M"),
+            end_datetime.strftime("%Y-%m-%d %H:%M"),
             0,
             25
         )
@@ -3333,15 +3354,16 @@ async def weekly_score_command(ctx,weeks=1):
                 ctx,
                 rows,
                 period_name,
-                start_date.isoformat(),
-                today.isoformat(),
+                start_datetime.strftime("%Y-%m-%d %H:%M"),
+                end_datetime.strftime("%Y-%m-%d %H:%M"),
                 page
             )
         )
 
         print(
             f"[주간 조회 성공] {period_name} / "
-            f"기간={start_date.isoformat()}~{today.isoformat()} / "
+            f"기간={start_datetime.strftime('%Y-%m-%d %H:%M')}~"
+            f"{end_datetime.strftime('%Y-%m-%d %H:%M')} / "
             f"인원={len(rows)}"
         )
 
